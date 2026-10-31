@@ -1,0 +1,7 @@
+# Model weights are downloaded separately (see README).
+/models/
+# Runtime state: timers, volume, personal memory.
+/state/
+.venv/
+__pycache__/
+*.pyc

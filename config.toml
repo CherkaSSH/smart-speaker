@@ -1,0 +1,143 @@
+# Smart speaker configuration. Paths are relative to this file.
+# Every process (llm, asr, brain, voice) reads this same file, so each can be
+# started on its own (`speaker brain`, `speaker voice`, ...) or all together
+# (`speaker up`).
+
+[character]
+# Who the speaker is. Sent to the LLM as the system prompt, before the
+# built-in rules about speaking style and tools.
+prompt = """
+Ты — домашняя колонка с характером: грубоватая, ленивая, саркастичная, но
+всё-таки делаешь, что просят, и отвечаешь по делу. Можешь подколоть и
+ругнуться, но без злобы. Своё имя и прозвище вслух не произноси.
+"""
+# What the speaker says when it hears only the wake phrase.
+ack = { ru = "Чё надо?", en = "What do you want?" }
+
+[wake]
+# Spoken phrases that wake the speaker. Matching tolerates ASR spelling
+# slips ("долбоеб", "пей долбаёб"); `threshold` is the minimum similarity 0..1.
+phrases = ["эй долбаёб", "долбаёб"]
+threshold = 0.78
+# Recognition bias toward the phrases above. Higher catches more mumbled
+# wakes but starts hearing the phrase in other speech (5 already does).
+boost = 2.0
+# Words that stop speech, a ringing timer or the current answer without the
+# wake phrase, as long as the utterance is only that word.
+stop_words = ["стоп", "хватит", "замолчи", "заткнись", "тихо", "отмена", "stop", "enough", "cancel", "shut up"]
+
+[gate]
+# Silero VAD skips silence, then Vosk small Russian listens for the wake
+# phrase. The large Nemotron streams activate only after this gate (or while
+# an answer/ring is active) and still verify the recognized text.
+enabled = true
+vad_model = "models/silero/vad.jit"
+model = "models/vosk-model-small-ru-0.22"
+vad_threshold = 0.5
+preroll_seconds = 2.0
+# Vosk's dictionary lacks "долбаёб" but knows these recognized spellings.
+grammar = ["эй долбоёб", "и долбоёб", "долбоёб", "[unk]"]
+
+[audio]
+# Substring of the PortAudio device name ("default" for the system default).
+# speaker_in/speaker_out are the shared ALSA devices from alsa/speaker.conf;
+# point that file at another card to change hardware.
+input_device = "speaker_in"
+output_device = "speaker_out"
+sample_rate = 48000
+# Output channels the voice goes to. [0, 1] = both; [1] = right only.
+output_channels = [0, 1]
+# Mic gain applied before ASR (the headset mic is quiet).
+mic_gain = 4.0
+# Initial volume 0..10, like Yandex Station. Changed by voice later.
+volume = 6
+
+[asr]
+url = "ws://127.0.0.1:8090/v1/audio/transcriptions/realtime"
+model = "models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
+port = 8090
+# Trailing silence that ends an utterance. Shorter answers sooner but cuts
+# people off at pauses.
+endpoint_ms = 500
+threads = 4
+# Language of the always-on stream that listens for the wake phrase and
+# Russian commands. "auto" garbles a Russian wake phrase into Latin letters.
+language = "ru-RU"
+# Run a second, language-detecting stream so English commands work after the
+# wake phrase (say the wake phrase, wait for the answer, then speak English).
+detect_english = true
+
+[tts]
+# Silero voices. Russian speakers: aidar, baya, kseniya, xenia, eugene.
+ru_model = "models/silero/v5_6_ru.pt"
+ru_speaker = "aidar"
+en_model = "models/silero/v3_en.pt"
+en_speaker = "en_0"
+sample_rate = 24000
+threads = 4
+
+[llm]
+url = "http://127.0.0.1:8091/v1"
+model = "models/LFM3-1.7B-QAD-Q4_0.gguf"
+port = 8091
+gpu_layers = 99
+context = 16384
+# Hidden reasoning before each answer. More is smarter but slower: the 780M
+# generates ~65 tokens/s, so 64 tokens costs about one second. 128 gave no
+# better answers in testing, only slower ones.
+reasoning_budget = 64
+# Reasoning after a tool returned (0 = none: just phrase the result).
+tool_reasoning_budget = 0
+# Upper bound, not a target: normal answers still stop at their natural end.
+max_tokens = 4096
+temperature = 0.1
+
+[remote_llm]
+# Explicit requests leave the machine only when this is enabled and the key is
+# present. Any OpenAI-compatible /chat/completions endpoint works.
+enabled = false
+url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+api_key_env = "REMOTE_LLM_API_KEY"
+max_tokens = 4096
+temperature = 0.3
+timeout = 180
+triggers = ["спроси большую модель", "ask the big model", "use the big model"]
+
+[harness]
+# A real argv command, not a shell string. Every %p is replaced with the user
+# prompt, e.g. 'pi -p %p'. Authentication and tools belong to that harness.
+enabled = false
+command = "pi -p %p"
+cwd = "."
+timeout = 300
+triggers = ["запусти агента", "используй агента", "use the harness", "run the harness"]
+
+[memory]
+# Downloaded from Hugging Face on first use. Only the 270M text encoder is
+# loaded; embeddings and text persist locally in SQLite.
+model = "google/embeddinggemma-2"
+state_file = "state/memory.sqlite3"
+search_results = 5
+# Before each LLM answer, memories at least this similar to the request are
+# added to its prompt (~50 ms). Related facts scored 0.77+, unrelated ≤0.67
+# in testing. 0 disables automatic recall; the search_memory tool remains.
+recall_threshold = 0.72
+recall_results = 3
+
+[brain]
+host = "127.0.0.1"
+port = 8770
+# Answer timers, volume, stop and time instantly without the LLM.
+fast_commands = true
+# Weather location used when none is named (Open-Meteo, no API key).
+home_city = "Москва"
+state_file = "state/brain.json"
+
+[voice]
+brain_url = "ws://127.0.0.1:8770/ws"
+# If the speaker explicitly asks a question, listen this long for its answer.
+# Ordinary answers return to idle and require the wake phrase again.
+follow_up_seconds = 6
+# After the bare wake phrase, wait this long for the command.
+listen_seconds = 7
