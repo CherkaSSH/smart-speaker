@@ -34,6 +34,9 @@ enabled = true
 vad_model = "models/silero/vad.jit"
 model = "models/vosk-model-small-ru-0.22"
 vad_threshold = 0.5
+# 100 ms chunks below this RMS (after mic_gain) skip VAD entirely. This room
+# measured ≤0.0006 when quiet and 0.005-0.04 for speech chunks. 0 = always run VAD.
+energy_floor = 0.0015
 preroll_seconds = 2.0
 # Vosk's dictionary lacks "долбаёб" but knows these recognized spellings.
 grammar = ["эй долбоёб", "и долбоёб", "долбоёб", "[unk]"]
@@ -44,7 +47,11 @@ grammar = ["эй долбоёб", "и долбоёб", "долбоёб", "[unk]"
 # point that file at another card to change hardware.
 input_device = "speaker_in"
 output_device = "speaker_out"
+# Output rate, and the mic capture rate. Mic audio is resampled to the 16 kHz
+# speech recognition uses; a mic that sounds right at 16 kHz can set
+# input_rate = 16000 (with the same rate in alsa/speaker.conf) to skip that.
 sample_rate = 48000
+input_rate = 48000
 # Output channels the voice goes to. [0, 1] = both; [1] = right only.
 output_channels = [0, 1]
 # Mic gain applied before ASR (the headset mic is quiet).
@@ -59,6 +66,10 @@ port = 8090
 # Trailing silence that ends an utterance. Shorter answers sooner but cuts
 # people off at pauses.
 endpoint_ms = 500
+# "vulkan" runs Nemotron on the Radeon iGPU: 5x faster than real time with
+# ~1/20 of the CPU time (CPU needs ~2 CPU-seconds per audio second at any
+# thread count). "cpu" also works; threads = CPU compute threads.
+device = "vulkan"
 threads = 4
 # Language of the always-on stream that listens for the wake phrase and
 # Russian commands. "auto" garbles a Russian wake phrase into Latin letters.
@@ -114,14 +125,19 @@ timeout = 300
 triggers = ["запусти агента", "используй агента", "use the harness", "run the harness"]
 
 [memory]
-# Downloaded from Hugging Face on first use. Only the 270M text encoder is
-# loaded; embeddings and text persist locally in SQLite.
-model = "google/embeddinggemma-2"
+# EmbeddingGemma 2 (Q8_0 GGUF from ggml-org/embeddinggemma-2-GGUF) served by
+# `speaker embed`. On the iGPU an embedding takes ~18 ms (131 ms on 4 CPU
+# threads); it runs before LFM3 generates, so they don't compete.
+model = "models/embeddinggemma-2-Q8_0.gguf"
+url = "http://127.0.0.1:8092/v1"
+port = 8092
+gpu_layers = 99
+threads = 4
 state_file = "state/memory.sqlite3"
 search_results = 5
 # Before each LLM answer, memories at least this similar to the request are
-# added to its prompt (~50 ms). Related facts scored 0.77+, unrelated ≤0.67
-# in testing. 0 disables automatic recall; the search_memory tool remains.
+# added to its prompt. Related facts scored 0.77+, unrelated ≤0.67 in testing.
+# 0 disables automatic recall; the search_memory tool remains.
 recall_threshold = 0.72
 recall_results = 3
 

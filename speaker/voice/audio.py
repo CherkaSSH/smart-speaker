@@ -15,6 +15,7 @@ import soxr
 log = logging.getLogger("voice.audio")
 
 ASR_RATE = 16000
+PAUSE_AFTER = 2.0  # seconds of silence before the output stream stops
 
 
 def find_device(name: str, kind: str) -> int | None:
@@ -38,7 +39,7 @@ class Mic:
 
     def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop, queues: list[asyncio.Queue],
                  gated_streams: list | None = None):
-        self.rate = int(cfg["sample_rate"])
+        self.rate = int(cfg["input_rate"])
         self.gain = float(cfg["mic_gain"])
         self.device = find_device(cfg["input_device"], "input")
         info = sd.query_devices(self.device, "input")
@@ -46,14 +47,16 @@ class Mic:
         self.queues = queues
         self.gated_streams = gated_streams or []
         self._loop = loop
-        self._resampler = soxr.ResampleStream(self.rate, ASR_RATE, 1, dtype="float32")
+        # Only needed when the device can't capture at the ASR rate itself.
+        self._resampler = soxr.ResampleStream(self.rate, ASR_RATE, 1, dtype="float32") \
+            if self.rate != ASR_RATE else None
         self._stream = sd.InputStream(device=self.device, samplerate=self.rate, channels=self.channels,
                                       dtype="float32", blocksize=self.rate // 10, callback=self._callback)
 
     def _callback(self, data, frames, t, status) -> None:
         captured = time.monotonic() - frames / self.rate
         mono = data.mean(axis=1) * self.gain
-        pcm = self._resampler.resample_chunk(mono)
+        pcm = self._resampler.resample_chunk(mono) if self._resampler else mono
         pcm16 = (np.clip(pcm, -1, 1) * 32767).astype(np.int16).tobytes()
         try:
             self._loop.call_soon_threadsafe(self._push, (captured, pcm16))
@@ -98,8 +101,11 @@ class Player:
         self._loop = loop
         self._idle = asyncio.Event()
         self._idle.set()
-        self._stream = sd.OutputStream(device=self.device, samplerate=self.rate, channels=self.channels,
-                                       dtype="float32", blocksize=self.rate // 50, callback=self._callback)
+        self._pause_timer: asyncio.TimerHandle | None = None
+        # Open only while there is something to play: with no client, dmix stops
+        # the card, so an idle speaker neither wakes the CPU nor keeps the DAC busy.
+        # Opening takes about 1-2 ms.
+        self._stream: sd.OutputStream | None = None
 
     def set_volume(self, level: int) -> None:
         self.gain = volume_gain(level)
@@ -126,8 +132,29 @@ class Player:
     def _mark_idle(self) -> None:
         # Re-checked on the loop: a clip queued since the callback must keep us busy.
         with self._lock:
-            if not self._clips:
-                self._idle.set()
+            if self._clips:
+                return
+        self._idle.set()
+        self._schedule_pause()
+
+    def _schedule_pause(self) -> None:
+        if self._pause_timer:
+            self._pause_timer.cancel()
+        # Short gaps between sentences and clips keep the stream open.
+        self._pause_timer = self._loop.call_later(PAUSE_AFTER, self._pause)
+
+    def _pause(self) -> None:
+        self._pause_timer = None
+        with self._lock:
+            if self._clips:
+                return
+        self._close_stream()
+
+    def _close_stream(self) -> None:
+        if self._stream is not None:
+            self._stream.abort()  # only silence is left in the buffer
+            self._stream.close()
+            self._stream = None
 
     def play(self, audio: np.ndarray, rate: int) -> None:
         if rate != self.rate:
@@ -135,12 +162,20 @@ class Player:
         with self._lock:
             self._clips.append(audio.astype(np.float32))
             self._idle.clear()
+        if self._pause_timer:
+            self._pause_timer.cancel()
+            self._pause_timer = None
+        if self._stream is None:
+            self._stream = sd.OutputStream(device=self.device, samplerate=self.rate, channels=self.channels,
+                                           dtype="float32", blocksize=self.rate // 50, callback=self._callback)
+            self._stream.start()
 
     def stop(self) -> None:
         with self._lock:
             self._clips.clear()
             self._pos = 0
         self._idle.set()
+        self._schedule_pause()
 
     @property
     def playing(self) -> bool:
@@ -149,9 +184,7 @@ class Player:
     async def wait_idle(self) -> None:
         await self._idle.wait()
 
-    def start(self) -> None:
-        self._stream.start()
-
     def close(self) -> None:
-        self._stream.stop()
-        self._stream.close()
+        if self._pause_timer:
+            self._pause_timer.cancel()
+        self._close_stream()

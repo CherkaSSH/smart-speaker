@@ -20,11 +20,25 @@ def llm_cmd(cfg: config_mod.Config) -> list[str]:
             "-ngl", str(c["gpu_layers"]), "-c", str(c["context"]), "-np", "1", "--jinja", "--log-disable"]
 
 
+def embed_cmd(cfg: config_mod.Config) -> list[str]:
+    c = cfg["memory"]
+    return ["llama-server", "-m", str(cfg.file(c["model"])), "--host", "127.0.0.1", "--port", str(c["port"]),
+            "--embeddings", "--pooling", "mean", "-ngl", str(c["gpu_layers"]), "-c", "2048", "-np", "1",
+            "-t", str(c["threads"]), "--log-disable"]
+
+
 def asr_cmd(cfg: config_mod.Config) -> list[str]:
     c = cfg["asr"]
-    return ["nemo-speech", "serve", "--asr.model.path", str(cfg.file(c["model"])), "--asr.backend.gpu", "-1",
-            "--endpointing", "--stop-history-eou-ms", str(c["endpoint_ms"]), "--port", str(c["port"]),
-            "--no-ui", "--threads", str(c["threads"])]
+    # asr.backend.threads sizes the CPU compute pool; `serve --threads` would only
+    # size the HTTP worker pool, leaving compute at min(8, cores) busy-waiting threads.
+    cmd = ["nemo-speech", "serve", "--asr.model.path", str(cfg.file(c["model"])), "--device", c["device"],
+           "--asr.backend.threads", str(c["threads"]), "--endpointing",
+           "--stop-history-eou-ms", str(c["endpoint_ms"]), "--port", str(c["port"]), "--no-ui"]
+    if c["device"] != "cpu":
+        # Cross-stream batching aborts on Vulkan at startup (GGML_ASSERT in mul_mat,
+        # nemo-speech 0.3.0); two streams don't need it.
+        cmd.append("--asr.batching.enabled=false")
+    return cmd
 
 
 async def _wait_http(url: str, timeout: float = 120) -> None:
@@ -51,8 +65,10 @@ async def up(cfg: config_mod.Config, args) -> None:
 
     try:
         await start("llm", llm_cmd(cfg), quiet=not args.verbose)
+        await start("embed", embed_cmd(cfg), quiet=not args.verbose)
         await start("asr", asr_cmd(cfg), quiet=not args.verbose)
         await _wait_http(f"http://127.0.0.1:{cfg['llm']['port']}/health")
+        await _wait_http(f"http://127.0.0.1:{cfg['memory']['port']}/health")
         await _wait_http(f"http://127.0.0.1:{cfg['asr']['port']}/health")
         await start("brain", [*me, "brain"])
         await asyncio.sleep(1)
@@ -85,6 +101,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("up", help="run everything")
     sub.add_parser("llm", help="run llama-server with LFM3")
+    sub.add_parser("embed", help="run llama-server with EmbeddingGemma 2 for memory")
     sub.add_parser("asr", help="run the Nemotron ASR server")
     sub.add_parser("brain", help="run the thinking service")
     sub.add_parser("voice", help="run the audio service")
@@ -101,6 +118,8 @@ def main() -> None:
     cfg = config_mod.load(args.config)
     if args.cmd == "llm":
         os.execvp("llama-server", llm_cmd(cfg))
+    elif args.cmd == "embed":
+        os.execvp("llama-server", embed_cmd(cfg))
     elif args.cmd == "asr":
         os.execvp("nemo-speech", asr_cmd(cfg))
     elif args.cmd == "brain":

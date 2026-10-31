@@ -38,6 +38,7 @@ log = logging.getLogger("voice")
 ECHO_WORD_OVERLAP = 0.5
 CONVERSATION_STATES = {"listening", "speaking", "thinking", "ringing"}
 RING_SECONDS = 60
+ECHO_TAIL = 0.5  # seconds after our last sound that the mic may still hear it (buffers, room echo)
 
 
 class Voice:
@@ -55,7 +56,8 @@ class Voice:
         self.asr_alt = ASR("auto", a, "auto", [], 0, None, self.on_alt_final) if a["detect_english"] else None
         self.streams = [self.asr] + ([self.asr_alt] if self.asr_alt else [])
         self.tts = TTS(cfg, cfg["tts"])
-        self.gate = Gate(cfg, self.on_small_wake) if cfg["gate"]["enabled"] else None
+        self.gate = Gate(cfg, self.on_small_wake, lambda: self.player.last_sound + ECHO_TAIL) \
+            if cfg["gate"]["enabled"] else None
         self.recognition_active = self.gate is None
         if self.gate:
             for stream in self.streams:
@@ -83,18 +85,23 @@ class Voice:
 
     # Helpers -------------------------------------------------------------
     def _set_streams_active(self, active: bool) -> None:
-        if self.gate is None or self.recognition_active == active:
+        """Large ASR on or off. The English stream's text is only used in a
+        conversation, so it stays off while the gate's wake is being verified."""
+        if self.gate is None:
             return
-        self.recognition_active = active
-        self.gate.active = active
-        log.info("large ASR %s", "active" if active else "idle")
-        if active:
-            preroll = self.gate.preroll()
-            for stream in self.streams:
-                stream.activate(preroll)
-        else:
-            self.gate.reset()
-            for stream in self.streams:
+        if active != self.recognition_active:
+            self.recognition_active = active
+            self.gate.active = active
+            log.info("large ASR %s", "active" if active else "idle")
+            if not active:
+                self.gate.reset()
+        wanted = [(self.asr, active)]
+        if self.asr_alt:
+            wanted.append((self.asr_alt, active and self.state in CONVERSATION_STATES))
+        for stream, on in wanted:
+            if on and not stream.active:
+                stream.activate(self.gate.preroll())
+            elif not on and stream.active:
                 stream.deactivate()
 
     async def on_small_wake(self) -> None:
@@ -371,7 +378,6 @@ class Voice:
                 await asyncio.sleep(1)
 
     async def run(self) -> None:
-        self.player.start()
         self.mic.start()
         log.info("ready; say %r", self.cfg["wake"]["phrases"][0])
         try:

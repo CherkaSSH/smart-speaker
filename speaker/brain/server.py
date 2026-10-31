@@ -270,9 +270,9 @@ async def serve(cfg: Config) -> None:
     b = cfg["brain"]
     await web.TCPSite(runner, b["host"], int(b["port"])).start()
     log.info("brain listening on %s:%s", b["host"], b["port"])
-    warm = asyncio.create_task(brain.memory.warm())
     try:
         await brain.scheduler.run()
     finally:
         await brain.llm.close()
+        await brain.memory.close()
         await runner.cleanup()

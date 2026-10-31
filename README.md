@@ -6,10 +6,10 @@ The default character is a sarcastic Russian speaker woken by **«Эй, долб
 
 ## Parts
 
-- **Voice** (`speaker/voice/`): microphone capture, wake/stop phrases, echo rejection, barge-in, follow-up listening and Silero TTS playback.
-- **Speech gate** (`speaker/voice/gate.py`): Silero VAD (~2 MB) skips silence and Vosk small Russian (~50 MB) detects the wake phrase. Two seconds of pre-roll preserve the complete command.
-- **ASR**: Nemotron 0.6B streaming through `nemo-speech`, on CPU. It activates after the small wake gate and stays active during an answer or ring. A Russian stream handles wake verification and Russian commands; an optional auto-detect stream handles English.
-- **Brain** (`speaker/brain/`): LFM3-1.7B through `llama-server` on the Radeon iGPU, with timers, alarms, volume, arithmetic, weather and Wikipedia tools. Common commands bypass the LLM. Optional escalation streams a larger OpenAI-compatible API model or runs a real agent command. Personal memory uses local EmbeddingGemma 2 semantic search.
+- **Voice** (`speaker/voice/`): microphone capture, wake/stop phrases, echo rejection, barge-in, follow-up listening and Silero TTS playback. The output device is opened only while something plays.
+- **Speech gate** (`speaker/voice/gate.py`): an energy check and Silero VAD (~2 MB) skip silence, and Vosk small Russian (~50 MB) detects the wake phrase. Two seconds of pre-roll preserve the complete command. Our own playback (plus a 0.5 s tail) is ignored so answers can't wake the speaker.
+- **ASR**: Nemotron 0.6B streaming through `nemo-speech`, on the Radeon iGPU via Vulkan. It activates after the small wake gate and stays active during an answer or ring. A Russian stream verifies the wake phrase and handles Russian commands; an optional auto-detect stream handles English once a conversation is open.
+- **Brain** (`speaker/brain/`): LFM3-1.7B through `llama-server` on the Radeon iGPU, with timers, alarms, volume, arithmetic, weather and Wikipedia tools. Common commands bypass the LLM. Optional escalation streams a larger OpenAI-compatible API model or runs a real agent command. Personal memory uses EmbeddingGemma 2 semantic search through a second `llama-server`.
 - **Configuration**: one `config.toml` shared by every process.
 
 ## Setup
@@ -26,6 +26,7 @@ The model files are not downloaded by the flake. Put these files under `models/`
 
 ```text
 models/LFM3-1.7B-QAD-Q4_0.gguf
+models/embeddinggemma-2-Q8_0.gguf
 models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf
 models/silero/v5_6_ru.pt
 models/silero/v3_en.pt
@@ -33,9 +34,9 @@ models/silero/vad.jit
 models/vosk-model-small-ru-0.22/
 ```
 
-LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3 requires the llama.cpp build from this flake, not the older nixpkgs build. The VAD file is `silero_vad.jit` from `snakers4/silero-vad`; the wake model is `vosk-model-small-ru-0.22` from `alphacephei.com/vosk/models`.
+LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3 requires the llama.cpp build from this flake, not the older nixpkgs build. The embedding model is `embeddinggemma-2-Q8_0.gguf` from `ggml-org/embeddinggemma-2-GGUF`. The VAD file is `silero_vad.jit` from `snakers4/silero-vad`; the wake model is `vosk-model-small-ru-0.22` from `alphacephei.com/vosk/models`.
 
-`alsa/speaker.conf` currently targets the Razer Kraken V3 X (`CARD=X`) and exposes shared `speaker_in`/`speaker_out` devices. Change the card there for standalone microphones or speakers. The current headset test setup plays the simulated user into the **right earcup**, near the microphone.
+`alsa/speaker.conf` currently targets the Razer Kraken V3 X (`CARD=X`) and exposes shared `speaker_in`/`speaker_out` devices. Change the card there for standalone microphones or speakers, then re-enter `nix develop` (the dev shell copies the file). The capture period is 100 ms and the playback period 40 ms to keep idle CPU wakeups low. The current headset test setup plays the simulated user into the **right earcup**, near the microphone.
 
 ### Optional escalation
 
@@ -64,7 +65,7 @@ The harness supplies its own model authentication and tools. API and harness mod
 
 `save_memory` and `search_memory` let LFM3 persist durable facts and retrieve them when relevant. For example, say **«запомни, что я люблю овсяное молоко»**, then later ask what milk you prefer. Text and normalized 768-dimensional embeddings are stored in `state/memory.sqlite3`.
 
-Retrieval uses **EmbeddingGemma 2** in its 270M-parameter text-only mode, locally on CPU with float32 precision (it loads in about 3 seconds when the brain starts; each search takes about 50 ms). The first start downloads the model from Hugging Face. Before each LLM answer, memories closely related to the request (`recall_threshold`) are added to the prompt automatically, because LFM3 does not reliably decide to search on its own; broader questions such as «что ты обо мне помнишь?» use the `search_memory` tool.
+Retrieval uses **EmbeddingGemma 2** (text-only Q8_0 GGUF) served by `speaker embed` on the iGPU: about 18 ms per embedding, ~200 MB of memory, and no PyTorch in the brain. Before each LLM answer, memories closely related to the request (`recall_threshold`) are added to the prompt automatically, because LFM3 does not reliably decide to search on its own; broader questions such as «что ты обо мне помнишь?» use the `search_memory` tool. If the embedding server is down, answers still work without recall.
 
 ## Run
 
@@ -76,12 +77,13 @@ For separate terminals, start in this order:
 
 ```sh
 speaker llm
+speaker embed
 speaker asr
 speaker brain
 speaker voice
 ```
 
-Use `speaker -v up` to include llama.cpp and ASR server logs. Stop `speaker up` with Ctrl-C; it stops all four processes.
+Use `speaker -v up` to include llama.cpp and ASR server logs. Stop `speaker up` with Ctrl-C; it stops all five processes.
 
 Ask the running brain without using the microphone:
 

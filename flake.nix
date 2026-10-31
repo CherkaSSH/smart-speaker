@@ -33,9 +33,9 @@
         ];
       };
 
-      # NVIDIA's native runtime for Nemotron/Parakeet ASR (CPU build: the iGPU
-      # is left to the LLM). The CMake build applies its own ggml patch series
-      # with git, so git must be on the build PATH.
+      # NVIDIA's native runtime for Nemotron/Parakeet ASR, with Vulkan so it can
+      # run on the Radeon 780M ([asr] device). The CMake build applies its own
+      # ggml patch series with git, so git must be on the build PATH.
       nemo-speech = pkgs.stdenv.mkDerivation {
         pname = "nemo-speech";
         version = "0.3.0-20999cc";
@@ -46,12 +46,14 @@
           fetchSubmodules = true;
           hash = "sha256-UJdFdVYrvSsPntcUSP6oiPFz2/4X/13upncg0B1iepA=";
         };
-        nativeBuildInputs = with pkgs; [ cmake ninja pkg-config git python3 ];
-        buildInputs = with pkgs; [ sentencepiece abseil-cpp protobuf alsa-lib openssl ];
+        nativeBuildInputs = with pkgs; [ cmake ninja pkg-config git python3 shaderc ];
+        buildInputs = with pkgs; [ sentencepiece abseil-cpp protobuf alsa-lib openssl
+                                   vulkan-headers vulkan-loader spirv-headers ];
         cmakeFlags = [
           "-DCMAKE_BUILD_TYPE=Release"
           "-DGGML_NATIVE=ON"
           "-DGGML_LLAMAFILE=ON"
+          "-DGGML_VULKAN=ON"
           "-DNEMO_SPEECH_GGML_PATCHED=ON"
           "-DNEMO_SPEECH_BUILD_ASR=ON"
           "-DNEMO_SPEECH_BUILD_DIAR=OFF"
