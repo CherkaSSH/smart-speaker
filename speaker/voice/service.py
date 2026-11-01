@@ -75,7 +75,7 @@ class Voice:
         self.mic = Mic(cfg["audio"], loop,
                        [self.gate.audio] if self.gate else [s.audio for s in self.streams],
                        self.streams if self.gate else [],
-                       EchoCanceller(self.reference) if self.reference else None)
+                       EchoCanceller(self.reference, cfg["audio"]["echo_model"]) if self.reference else None)
         self.acks = {lang: self.tts.synth(text) for lang, text in cfg["character"]["ack"].items()}
         self.ack_texts = cfg["character"]["ack"]
 
@@ -104,6 +104,8 @@ class Voice:
             self.recognition_active = active
             self.gate.active = active
             log.info("large ASR %s", "active" if active else "idle")
+            if not active and self.asr.partial:
+                log.info("dropped unfinished %r", self.asr.partial)
             if not active:
                 self.gate.reset()
             self._update_duck()

@@ -32,7 +32,7 @@ from . import intents, speech
 from .escalate import Harness, RemoteLLM
 from .llm import LLM
 from .memory import Memory
-from .music import Music
+from .music import Music, asks_for_music
 from .timers import Item, Scheduler
 from .tools import BIG_MODEL_SCHEMA, SCHEMAS, WEB_SEARCH_SCHEMA, Tools
 from .websearch import WebSearch
@@ -95,7 +95,7 @@ You are the voice of a home smart speaker, like Yandex Station's Alice. Everythi
 - When ask_big_model is available, use it for requests beyond your reasoning or knowledge ability; the user is asked to confirm first.
 - For current events, news, prices, schedules or anything else Wikipedia wouldn't have, call web_search with an English objective and English queries, then answer from the results in the reply language.
 - Each user message starts with the current date, time and reply language in square brackets. Don't mention the date or time unless asked.
-- For music use play_music (a song, artist, "some music" or a radio station) and music_control (pause, resume, next, previous, stop).
+- Use play_music only when the user asks to play music: a song, an artist, "some music" or a radio station. Stories, fairy tales and poems you tell yourself. music_control pauses, resumes, skips (next, previous) or stops it.
 - You can't control other devices (lights, TV); say so briefly if asked.
 """
 
@@ -272,6 +272,8 @@ class Brain:
         async def run_tool(name: str, args: dict):
             if needs_confirm(name):
                 raise NeedsConfirmation("big" if name == "ask_big_model" else "search", args)
+            if name == "play_music" and not asks_for_music(text):
+                return {"error": "the user didn't ask for music; answer in words"}
             return await self.tools.call(name, args, lang)
 
         def preface(name: str) -> str | None:

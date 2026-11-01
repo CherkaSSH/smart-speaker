@@ -1,19 +1,25 @@
 """Acoustic echo cancellation: subtract what the speaker plays from what the mic hears.
 
 Every output path (speech, music) adds its blocks to one Reference, keyed by
-when they reach the speaker. The mic runs each chunk through WebRTC's AEC3 (the
-echo canceller in Chrome) against the matching stretch of the reference, so the
-wake gate and speech recognition hear the user rather than our own voice or the
-song. AEC3 estimates the remaining delay itself; the timestamps only need to be
-stable (see audio.TimedResampler), not exact.
+when they reach the speaker. The mic runs each chunk through LocalVQE, a small
+neural echo canceller (adaptive filter plus a GTCRN mask trained on double talk),
+against the matching stretch of the reference, so the wake gate and speech
+recognition hear the user rather than our own voice or the song. LocalVQE
+estimates the remaining delay itself; the timestamps only need to be stable
+(see audio.TimedResampler), not exact.
+
+WebRTC's AEC3 was measured first and dropped: over loud music its echo
+suppressor removed the user's voice along with the song, leaving the command
+less intelligible than the raw mic.
 """
 
 from __future__ import annotations
 
+import ctypes
+import os
 import threading
 
 import numpy as np
-from pywebrtc_audio import AudioProcessor
 
 RATE = 16000
 SECONDS = 10  # reference history kept
@@ -65,11 +71,77 @@ class Reference:
             return out
 
 
-class EchoCanceller:
-    def __init__(self, reference: Reference, delay_ms: int = 60):
-        self.reference = reference
-        self.ap = AudioProcessor(sample_rate=RATE, echo_cancellation=True, stream_delay_ms=delay_ms)
+_H = ctypes.c_size_t  # LocalVQE's opaque handles
+_FP = ctypes.POINTER(ctypes.c_float)
 
-    def process(self, near: np.ndarray, captured: float) -> np.ndarray:
-        """Mic audio (float32, 16 kHz) captured from `captured` on, with our own playback removed."""
-        return self.ap.process(near.astype(np.float32), self.reference.take(captured, len(near)))
+
+def _load_library() -> ctypes.CDLL:
+    path = os.environ.get("LOCALVQE_LIB")
+    if not path:
+        raise RuntimeError("LOCALVQE_LIB is not set: run inside the flake's dev shell (nix develop), "
+                           "or set [audio] echo_cancellation = false")
+    lib = ctypes.CDLL(path)
+    lib.localvqe_options_new.restype = _H
+    lib.localvqe_options_set_model_path.argtypes = [_H, ctypes.c_char_p]
+    lib.localvqe_options_set_threads.argtypes = [_H, ctypes.c_int]
+    lib.localvqe_options_free.argtypes = [_H]
+    lib.localvqe_new_with_options.argtypes = [_H]
+    lib.localvqe_new_with_options.restype = _H
+    lib.localvqe_hop_length.argtypes = [_H]
+    lib.localvqe_process_frame_f32.argtypes = [_H, _FP, _FP, ctypes.c_int, _FP]
+    return lib
+
+
+class EchoCanceller:
+    """LocalVQE over the mic stream, delaying it by one 16 ms hop.
+
+    It only runs while something plays, plus HOLD for the room's echo tail
+    (about 6% of a CPU core while active). In between, the mic passes through
+    the same delay unchanged, and the model keeps what it learned about the
+    room: a fresh one needs about 2.5 s to cancel fully again.
+    """
+
+    HOLD = 1.0
+
+    def __init__(self, reference: Reference, model: str):
+        self.reference = reference
+        self.lib = _load_library()
+        opts = self.lib.localvqe_options_new()
+        self.lib.localvqe_options_set_model_path(opts, model.encode())
+        self.lib.localvqe_options_set_threads(opts, 1)  # as fast as more for this model size
+        self.ctx = self.lib.localvqe_new_with_options(opts)
+        self.lib.localvqe_options_free(opts)
+        if not self.ctx:
+            raise RuntimeError(f"LocalVQE could not load {model}")
+        self.hop = self.lib.localvqe_hop_length(self.ctx)
+        self.delay = self.hop / RATE
+        self._near = np.zeros(0, np.float32)  # input not yet a full hop
+        self._far = np.zeros(0, np.float32)
+        self._out = np.zeros(self.hop, np.float32)  # output not yet returned; starts with the delay
+        self._hop_out = np.zeros(self.hop, np.float32)
+        self._active_until = 0.0
+
+    def process(self, near: np.ndarray, captured: float) -> tuple[np.ndarray, float]:
+        """Mic audio (16 kHz) captured from `captured` on -> (the same length with our
+        own playback removed, the capture time of its first sample)."""
+        far = self.reference.take(captured, len(near))
+        if far.any():
+            self._active_until = captured + len(near) / RATE + self.HOLD
+        active = captured < self._active_until
+        self._near = np.concatenate([self._near, near.astype(np.float32)])
+        self._far = np.concatenate([self._far, far])
+        hops = len(self._near) // self.hop
+        done = [self._out]
+        for k in range(hops):
+            m = np.ascontiguousarray(self._near[k * self.hop:(k + 1) * self.hop])
+            if active:
+                r = np.ascontiguousarray(self._far[k * self.hop:(k + 1) * self.hop])
+                self.lib.localvqe_process_frame_f32(self.ctx, m.ctypes.data_as(_FP), r.ctypes.data_as(_FP),
+                                                    self.hop, self._hop_out.ctypes.data_as(_FP))
+                done.append(self._hop_out.copy())
+            else:
+                done.append(m)
+        self._near, self._far = self._near[hops * self.hop:], self._far[hops * self.hop:]
+        out = np.concatenate(done)
+        self._out = out[len(near):]
+        return out[:len(near)], captured - self.delay

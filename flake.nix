@@ -66,6 +66,33 @@
         ];
       };
 
+      # Neural acoustic echo canceller (LocalVQE, Apache-2.0): removes our own music
+      # and speech from the mic while keeping the user's voice. The voice service
+      # loads liblocalvqe.so with ctypes; on x86 ggml picks its CPU variant at run
+      # time from the libggml-cpu-*.so files installed next to it.
+      localvqe = pkgs.stdenv.mkDerivation {
+        pname = "localvqe";
+        version = "0.1.0-7f61cd0";
+        src = pkgs.fetchFromGitHub {
+          owner = "localai-org";
+          repo = "LocalVQE";
+          rev = "7f61cd05095d42e56a135b303f5bb4d761da22b9";
+          fetchSubmodules = true;
+          hash = "sha256-iHMnP1EMiIjb0aofGJUKjMm8Z11W36SVYNYq0ZYowAc=";
+        };
+        sourceRoot = "source/ggml";
+        # CMake patches a GRU op into the vendored ggml with `git apply`.
+        nativeBuildInputs = with pkgs; [ cmake ninja pkg-config git autoPatchelfHook ];
+        buildInputs = with pkgs; [ libsndfile stdenv.cc.cc.lib ];
+        cmakeFlags = [ "-DCMAKE_BUILD_TYPE=Release" "-DLOCALVQE_BUILD_SHARED=ON"
+                       "-DCMAKE_SKIP_BUILD_RPATH=ON" ];  # autoPatchelfHook sets it from $out/lib
+        installPhase = ''
+          mkdir -p $out/bin $out/lib
+          cp -P bin/*.so* $out/lib/
+          cp bin/localvqe $out/bin/
+        '';
+      };
+
       # Wheels from uv (torch, onnxruntime, ...) dlopen these at run time.
       runtimeLibs = with pkgs; [
         stdenv.cc.cc.lib
@@ -77,7 +104,7 @@
     in
     {
       packages.${system} = {
-        inherit llama-cpp nemo-speech;
+        inherit llama-cpp nemo-speech localvqe;
       };
 
       devShells.${system}.default = pkgs.mkShell {
@@ -88,7 +115,9 @@
           ffmpeg
           llama-cpp
           nemo-speech
+          localvqe
         ];
+        LOCALVQE_LIB = "${localvqe}/lib/liblocalvqe.so";
         LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
         UV_PYTHON = "${pkgs.python312}/bin/python3.12";
         UV_PYTHON_DOWNLOADS = "never";

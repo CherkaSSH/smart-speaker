@@ -60,9 +60,11 @@ output_channels = [0, 1]
 mic_gain = 4.0
 # Initial volume 0..10, like Yandex Station. Changed by voice later.
 volume = 6
-# Subtract what the speaker plays (answers, music) from the mic with WebRTC's
-# AEC3 echo canceller, so the wake word and commands are heard over it.
+# Subtract what the speaker plays (answers, music) from the mic with LocalVQE,
+# a small neural echo canceller, so the wake word and commands are heard over
+# it. Needs the speaker and mic on one sound card (one clock).
 echo_cancellation = true
+echo_model = "models/localvqe-pi-aec-v1-49k-f32.gguf"
 
 [music]
 # Audio files to play (subfolders too). Optional sidecars per file: NAME.json

@@ -101,7 +101,7 @@ class Mic:
         if not len(pcm):
             return
         if self.echo is not None:
-            pcm = self.echo.process(pcm, captured)
+            pcm, captured = self.echo.process(pcm, captured)
         pcm16 = (np.clip(pcm, -1, 1) * 32767).astype(np.int16).tobytes()
         try:
             self._loop.call_soon_threadsafe(self._push, (captured, pcm16))

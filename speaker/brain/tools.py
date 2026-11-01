@@ -59,7 +59,8 @@ SCHEMAS = [
         "asks about preferences, past requests, or what you remember.",
         {"query": {"type": "string", "description": "What to find, in natural language"},
          "limit": {"type": "integer", "description": "Maximum results, 1-10; default 5"}}, ["query"]),
-    _fn("play_music", "Play music: a song, an artist, any music (empty query), or an internet radio station.",
+    _fn("play_music", "Play recorded music when the user asks to play or turn on a song, an artist, any music "
+        "(empty query) or an internet radio station. Not for stories, fairy tales or poems: tell those yourself.",
         {"query": {"type": "string", "description": "Song title or artist as the user said it; empty for any music"},
          "radio": {"type": "boolean", "description": "True for an internet radio station"}}),
     _fn("music_control", "Control the music that is playing.",

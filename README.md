@@ -32,9 +32,10 @@ models/silero/v5_6_ru.pt
 models/silero/v3_en.pt
 models/silero/vad.jit
 models/vosk-model-small-ru-0.22/
+models/localvqe-pi-aec-v1-49k-f32.gguf
 ```
 
-LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3 requires the llama.cpp build from this flake, not the older nixpkgs build. The embedding model is `embeddinggemma-2-Q8_0.gguf` from `ggml-org/embeddinggemma-2-GGUF`. The VAD file is `silero_vad.jit` from `snakers4/silero-vad`; the wake model is `vosk-model-small-ru-0.22` from `alphacephei.com/vosk/models`.
+LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3 requires the llama.cpp build from this flake, not the older nixpkgs build. The embedding model is `embeddinggemma-2-Q8_0.gguf` from `ggml-org/embeddinggemma-2-GGUF`. The VAD file is `silero_vad.jit` from `snakers4/silero-vad`; the wake model is `vosk-model-small-ru-0.22` from `alphacephei.com/vosk/models`. The echo canceller is `localvqe-pi-aec-v1-49k-f32.gguf` from `LocalAI-io/LocalVQE` on Hugging Face; the flake builds its library.
 
 `alsa/speaker.conf` currently targets the Razer Kraken V3 X (`CARD=X`) and exposes shared `speaker_in`/`speaker_out` devices. Change the card there for standalone microphones or speakers, then re-enter `nix develop` (the dev shell copies the file). The capture period is 100 ms and the playback period 40 ms to keep idle CPU wakeups low. The current headset test setup plays the simulated user into the **right earcup**, near the microphone.
 
@@ -103,17 +104,25 @@ Register it next to `LocalLibrary` and `Radio` in `Music.__init__` and add its n
 
 ### Echo cancellation
 
-With `[audio] echo_cancellation = true` (the default), the mic signal passes through WebRTC's AEC3 ([pywebrtc-audio](https://pypi.org/project/pywebrtc-audio/)) before the wake gate and ASR see it. AEC3 subtracts what the speaker itself plays: music, answers and sounds. Every output stream records its audio, resampled to 16 kHz, on a shared timeline counted in samples (`speaker/voice/echo.py`), so the reference lines up with the mic to within a few milliseconds. AEC3 finds the remaining delay itself.
+With `[audio] echo_cancellation = true` (the default), the mic signal passes through [LocalVQE](https://github.com/localai-org/LocalVQE) before the wake gate and ASR see it. LocalVQE is a small neural echo canceller (an adaptive filter plus a 49K-parameter GTCRN mask, `[audio] echo_model`), trained on double talk. It subtracts what the speaker itself plays (music, answers, sounds) and keeps the user's voice. Every output stream records its audio, resampled to 16 kHz, on a shared timeline counted in samples (`speaker/voice/echo.py`), so the reference lines up with the mic to within a few milliseconds. LocalVQE finds the remaining delay itself. The flake builds `liblocalvqe.so`, and the voice service calls it through ctypes, delaying the mic by one 16 ms hop.
 
-Measured with the test songs at volume 5 and a recorded «Эй, колонка, поставь на паузу» played over them, three runs per song:
+It runs only while something plays, plus 1 s for the room's echo: about 1 ms of CPU per 16 ms hop (6.5% of one core). Otherwise the mic passes through unchanged, and the voice service idles at about 1% CPU.
 
-| Song | Music in mic, raw → cancelled | Wake phrase verified, raw / cancelled |
-|---|---|---|
-| My Bonnie | 0.0069 → 0.0008 RMS (−19 dB) | 0/3 / 2/3 |
-| Эй, ухнем | 0.0014 → 0.0006 RMS (−8 dB) | 3/3 / 2/3 |
-| Хас-Булат | 0.0160 → 0.0008 RMS (−26 dB) | 3/3 / 3/3 |
+Measured through the real capture and playback path, with a recorded «Эй, колонка, поставь на паузу» played over each song from the same earcup. The loud test track is Bostaurus, «Will Bullets Stop The Violence» (2006, hardcore rock mastered at −8 LUFS; [CC BY-NC-ND 2.0 DE](https://archive.org/details/Bostaurus.Demo)), saved locally as `music/bostaurus-will-bullets.mp3`:
 
-The raw mic also put sung words into the command («Майболи добры одну хитрой колонка, поставь на паузу»); the cancelled mic didn't. The one cancelled miss was «Ei koloнka», which Nemotron wrote in mixed scripts. The canceller costs about 0.6 ms of CPU per 100 ms of audio. Lyrics and spoken answers stay in the text-level echo removal as a second line of defence. Set `echo_cancellation = false` if the output and input are different sound cards: their clocks drift apart, so the reference no longer lines up with the mic.
+| Song, volume | Music at the mic (the voice is −34 dBFS) | Music removed | Wake phrase verified, raw / cancelled |
+|---|---|---|---|
+| My Bonnie, 5 | −46 dBFS | 23 dB | ✗ (lyrics mixed in) / ✓ |
+| Хас-Булат, 5 | −39 dBFS | 28 dB | ✓ / ✓ |
+| Bostaurus, 5 | −38 dBFS | 14 dB | ✓ / ✓ |
+| Bostaurus, 7 | −32 dBFS | 14 dB | ✗ / ✓ |
+| Bostaurus, 10 | −23 dBFS | 13 dB | ✗ / ✗ |
+
+Through the running service, with six «Эй, колонка, что играет?» per run, Bostaurus at volume 7 was answered 15 times out of 18 over three runs. At volume 10 it was answered 3 times out of 18. There the voice is 10 dB below the music at the mic, the speech detector never fires even after cancellation, and the music is never turned down.
+
+WebRTC's AEC3 was tried first and dropped. Its echo suppressor also removed the user's voice: with Хас-Булат at volume 5, only 47% of the voice was left. With Bostaurus at volume 7, 34% was left, and recognition failed where the raw mic still worked.
+
+Lyrics and spoken answers stay in the text-level echo removal as a second line of defence. Set `echo_cancellation = false` if the output and input are different sound cards: their clocks drift apart, so the reference no longer lines up with the mic.
 
 ### Personal memory
 

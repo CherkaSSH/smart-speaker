@@ -105,6 +105,17 @@ def score(query: str, *fields: str) -> float:
     return best
 
 
+# Words a request to play music contains. LFM3 sometimes calls play_music for
+# «расскажи сказку» or «прочитай стихотворение»; without one of these the tool refuses.
+_ASKS_FOR_MUSIC = re.compile(r"\b(включ\w*|постав\w*|сыгра\w*|игра\w*|запуст\w*|послуша\w*|музык\w*|песн\w*|песен\w*|"
+                             r"трек\w*|радио|альбом\w*|play\w*|music|song\w*|radio|track\w*|listen\w*)\b",
+                             re.IGNORECASE)
+
+
+def asks_for_music(text: str) -> bool:
+    return bool(_ASKS_FOR_MUSIC.search(text))
+
+
 # Providers ----------------------------------------------------------------------
 class LocalLibrary:
     """Audio files under a folder. Optional sidecars: NAME.json (title, artist) and NAME.txt (lyrics)."""
