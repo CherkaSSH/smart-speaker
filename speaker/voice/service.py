@@ -75,7 +75,8 @@ class Voice:
         self.mic = Mic(cfg["audio"], loop,
                        [self.gate.audio] if self.gate else [s.audio for s in self.streams],
                        self.streams if self.gate else [],
-                       EchoCanceller(self.reference, cfg["audio"]["echo_model"]) if self.reference else None)
+                       EchoCanceller(self.reference, cfg["audio"]["echo_model"], cfg["audio"]["echo_music_model"])
+                       if self.reference else None)
         self.acks = {lang: self.tts.synth(text) for lang, text in cfg["character"]["ack"].items()}
         self.ack_texts = cfg["character"]["ack"]
 
@@ -171,8 +172,11 @@ class Voice:
         heard = [w for group in forms for w in group]
         said = {w for start, end, ws in self.spoken
                 if f.start < end + 0.5 and f.end > start - 0.3 for w in ws}
-        if self.music.state == "playing":
-            said |= self.music.lyric_words  # the singer is not the user
+        if self.music.state == "playing" and self.reference is None:
+            # Without echo cancellation the singer reaches the ASR, and is not the user.
+            # With it, the song is gone from the mic, and lyric words in the text are the
+            # user's own: «включи хас булат удалой» while Хас-Булат plays.
+            said |= self.music.lyric_words
 
         def echoed(w: str) -> bool:
             # ASR garbles our voice a little: "долла" for "доллара", "десятое" for "десятая".
@@ -183,10 +187,12 @@ class Voice:
         if not heard or not said or sum(is_echo) / len(forms) < ECHO_WORD_OVERLAP:
             return f.text
         keep = [not e for e in is_echo]
-        # Unless we said the wake phrase ourselves, a wake phrase in the mix is the user's.
+        # Unless we said the wake phrase ourselves, a wake phrase in the mix is the user's
+        # when it starts what they said. After our own words it is one of those words
+        # misheard: «Я расскажу тебе длинную колонка» for «...длинную сказку».
         m = self.wake.find(f.text)
         if m and not self.wake.find(" ".join(said)):
-            keep[m.start:m.end] = [True] * (m.end - m.start)
+            keep[m.start:m.end] = [not any(is_echo[:m.start])] * (m.end - m.start)
         return " ".join(t for t, k in zip(tokens, keep) if k)
 
     def is_stop(self, text: str) -> bool:

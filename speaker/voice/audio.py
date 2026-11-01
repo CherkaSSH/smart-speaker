@@ -42,25 +42,34 @@ class TimedResampler:
     """One stream's audio as 16 kHz mono, each output chunk dated by sample count.
 
     An echo canceller needs the mic and the speaker reference aligned to the sample.
-    Callback timestamps jitter by tens of milliseconds, and soxr returns output in
-    bursts (490, 979, ... samples for 640 expected), so chunks are dated from one
-    anchor plus the number of output samples so far. All streams of one sound card
-    share its clock, and both paths share soxr's delay, so they stay aligned.
+    Callback timestamps jitter, and soxr returns output in bursts (490, 979, ...
+    samples for 640 expected), so chunks are dated from an anchor plus the number
+    of output samples so far. All streams of one sound card share its clock, and
+    both paths share soxr's delay, so they stay aligned.
+
+    The anchor is the median of what the last blocks' timestamps imply: each one
+    is off by up to ±0.9 ms, and a stream's first blocks can be off by much more
+    (the mic's by 470 ms), so one timestamp alone can leave a stream misdated.
     """
 
-    RESYNC = 0.05  # re-anchor when counting drifts this far from PortAudio's time (an xrun)
+    RESYNC = 0.05  # restart from the current block when timestamps jump this far (an xrun, start-up)
+    WINDOW = 25
 
     def __init__(self, in_rate: int):
         self.in_rate = in_rate
         self.stream = soxr.ResampleStream(in_rate, ASR_RATE, 1, dtype="float32") if in_rate != ASR_RATE else None
         self.anchor: float | None = None
+        self._implied: deque[float] = deque(maxlen=self.WINDOW)
         self.frames_in = 0
         self.samples_out = 0
 
     def __call__(self, block: np.ndarray, measured: float) -> tuple[np.ndarray, float]:
         """(16 kHz mono, time of its first sample). `measured` is PortAudio's time of the block."""
-        if self.anchor is None or abs(self.anchor + self.frames_in / self.in_rate - measured) > self.RESYNC:
-            self.anchor = measured - self.frames_in / self.in_rate
+        implied = measured - self.frames_in / self.in_rate  # the anchor this block's timestamp implies
+        if self.anchor is not None and abs(implied - self.anchor) > self.RESYNC:
+            self._implied.clear()
+        self._implied.append(implied)
+        self.anchor = float(np.median(self._implied))
         mono = block.mean(axis=1) if block.ndim == 2 else block
         self.frames_in += len(mono)
         out = self.stream.resample_chunk(np.ascontiguousarray(mono, np.float32)) if self.stream else mono
@@ -173,7 +182,7 @@ class Player:
         if written:
             self.last_sound = time.monotonic() + written / self.rate
         if self.reference is not None:
-            self.reference.add(*self._timed(out, dac_time(t)))
+            self.reference.add(*self._timed(out, dac_time(t)), "voice")
         if empty and not self._idle.is_set():
             self._loop.call_soon_threadsafe(self._mark_idle)
 

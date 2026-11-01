@@ -185,7 +185,7 @@ class MusicPlayer:
             out[:, 0] = block.mean(axis=1)
         self.levels.append((time.monotonic(), float(np.sqrt(np.mean(block * block)))))
         if self.reference is not None:
-            self.reference.add(*self._timed(block, dac_time(t)))
+            self.reference.add(*self._timed(block, dac_time(t)), "music")
         if self._eof and n == 0 and not len(self._rest):
             self._loop.call_soon_threadsafe(self._finished, self._generation)
 

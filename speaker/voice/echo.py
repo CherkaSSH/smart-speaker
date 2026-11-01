@@ -26,13 +26,15 @@ SECONDS = 10  # reference history kept
 
 
 class Reference:
-    """Everything being played, mixed, as mono 16 kHz on a monotonic-time axis."""
+    """Everything being played, mixed, as mono 16 kHz on a monotonic-time axis,
+    plus when each source ("voice": speech and sounds, "music") last made sound."""
 
     def __init__(self):
         self.size = RATE * SECONDS
         self.ring = np.zeros(self.size, np.float32)
         self.origin: float | None = None
         self.cleared_to = 0  # sample index up to which the ring holds current (or zeroed) data
+        self.sounded = {"voice": 0.0, "music": 0.0}  # end of each source's last non-silent block
         self.lock = threading.Lock()
 
     def _index(self, t: float) -> int:
@@ -49,7 +51,7 @@ class Reference:
             self.ring[np.arange(self.cleared_to, end) % self.size] = 0
         self.cleared_to = end
 
-    def add(self, mono: np.ndarray, play_time: float) -> None:
+    def add(self, mono: np.ndarray, play_time: float, source: str) -> None:
         """Mono 16 kHz audio (see audio.TimedResampler) that reaches the speaker from play_time on."""
         n = len(mono)
         if not n:
@@ -58,6 +60,8 @@ class Reference:
             i0 = self._index(play_time)
             self._clear_to(i0 + n)
             self.ring[np.arange(i0, i0 + n) % self.size] += mono
+            if mono.any():
+                self.sounded[source] = max(self.sounded[source], play_time + n / RATE)
 
     def take(self, start: float, n: int) -> np.ndarray:
         """n samples of what the speaker played from `start`; silence where nothing was."""
@@ -95,48 +99,56 @@ def _load_library() -> ctypes.CDLL:
 class EchoCanceller:
     """LocalVQE over the mic stream, delaying it by one 16 ms hop.
 
-    It only runs while something plays, plus HOLD for the room's echo tail
-    (about 6% of a CPU core while active). In between, the mic passes through
-    the same delay unchanged, and the model keeps what it learned about the
-    room: a fresh one needs about 2.5 s to cancel fully again.
+    Two models, each for what it does best (measured over the same mic):
+    - our own speech: the 200K model let «стоп» through over a long answer in 3 of
+      4 tries, the 49K model in 0 of 4;
+    - music: the 49K model kept commands over loud rock at volume 7 (15 of 18),
+      the 200K model didn't (2 of 12).
+    Our speech wins while it plays (it is what barge-in talks over); music alone
+    goes to the music model. Only one runs per hop (about 6-9% of a CPU core), and
+    only while something plays plus HOLD for the room's echo tail. In between, the
+    mic passes through the same delay unchanged, and each model keeps what it
+    learned about the room: a fresh one needs about 2.5 s to cancel fully again.
     """
 
     HOLD = 1.0
 
-    def __init__(self, reference: Reference, model: str):
+    def __init__(self, reference: Reference, voice_model: str, music_model: str):
         self.reference = reference
         self.lib = _load_library()
-        opts = self.lib.localvqe_options_new()
-        self.lib.localvqe_options_set_model_path(opts, model.encode())
-        self.lib.localvqe_options_set_threads(opts, 1)  # as fast as more for this model size
-        self.ctx = self.lib.localvqe_new_with_options(opts)
-        self.lib.localvqe_options_free(opts)
-        if not self.ctx:
-            raise RuntimeError(f"LocalVQE could not load {model}")
-        self.hop = self.lib.localvqe_hop_length(self.ctx)
+        self.ctx = {"voice": self._load(voice_model), "music": self._load(music_model)}
+        self.hop = self.lib.localvqe_hop_length(self.ctx["voice"])
         self.delay = self.hop / RATE
         self._near = np.zeros(0, np.float32)  # input not yet a full hop
         self._far = np.zeros(0, np.float32)
         self._out = np.zeros(self.hop, np.float32)  # output not yet returned; starts with the delay
         self._hop_out = np.zeros(self.hop, np.float32)
-        self._active_until = 0.0
+
+    def _load(self, model: str) -> int:
+        opts = self.lib.localvqe_options_new()
+        self.lib.localvqe_options_set_model_path(opts, model.encode())
+        self.lib.localvqe_options_set_threads(opts, 1)  # as fast as more for these model sizes
+        ctx = self.lib.localvqe_new_with_options(opts)
+        self.lib.localvqe_options_free(opts)
+        if not ctx:
+            raise RuntimeError(f"LocalVQE could not load {model}")
+        return ctx
 
     def process(self, near: np.ndarray, captured: float) -> tuple[np.ndarray, float]:
         """Mic audio (16 kHz) captured from `captured` on -> (the same length with our
         own playback removed, the capture time of its first sample)."""
         far = self.reference.take(captured, len(near))
-        if far.any():
-            self._active_until = captured + len(near) / RATE + self.HOLD
-        active = captured < self._active_until
+        sounded = self.reference.sounded
+        ctx = next((self.ctx[s] for s in ("voice", "music") if captured < sounded[s] + self.HOLD), None)
         self._near = np.concatenate([self._near, near.astype(np.float32)])
         self._far = np.concatenate([self._far, far])
         hops = len(self._near) // self.hop
         done = [self._out]
         for k in range(hops):
             m = np.ascontiguousarray(self._near[k * self.hop:(k + 1) * self.hop])
-            if active:
+            if ctx is not None:
                 r = np.ascontiguousarray(self._far[k * self.hop:(k + 1) * self.hop])
-                self.lib.localvqe_process_frame_f32(self.ctx, m.ctypes.data_as(_FP), r.ctypes.data_as(_FP),
+                self.lib.localvqe_process_frame_f32(ctx, m.ctypes.data_as(_FP), r.ctypes.data_as(_FP),
                                                     self.hop, self._hop_out.ctypes.data_as(_FP))
                 done.append(self._hop_out.copy())
             else:

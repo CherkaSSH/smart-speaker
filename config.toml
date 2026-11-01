@@ -17,7 +17,7 @@ ack = { ru = "Чё такое?", en = "What do you want?" }
 [wake]
 # Spoken phrases that wake the speaker. Matching tolerates ASR spelling
 # slips ("долбоеб", "пей долбаёб"); `threshold` is the minimum similarity 0..1.
-phrases = ["Эй гптшка", "Эй колонка", "гптшка", "колонка"]
+phrases = ["Эй колонка", "колонка"]
 threshold = 0.78
 # Recognition bias toward the phrases above. Higher catches more mumbled
 # wakes but starts hearing the phrase in other speech (5 already does).
@@ -39,9 +39,9 @@ vad_threshold = 0.5
 energy_floor = 0.0015
 preroll_seconds = 2.0
 # What the small Vosk model hears for each wake phrase; any of these opens the
-# gate and Nemotron then checks the real phrase. Must use words Vosk knows (it
-# lacks "гптшка" and hears it as "наташка"); update this with [wake] phrases.
-grammar = ["эй колонка", "и колонка", "колонка", "эй наташка", "и наташка", "наташка", "[unk]"]
+# gate and Nemotron then checks the real phrase. Must use words Vosk knows (a
+# made-up word like "гптшка" comes out as "наташка"); update this with [wake] phrases.
+grammar = ["эй колонка", "и колонка", "колонка", "[unk]"]
 
 [audio]
 # Substring of the PortAudio device name ("default" for the system default).
@@ -64,12 +64,16 @@ volume = 6
 # a small neural echo canceller, so the wake word and commands are heard over
 # it. Needs the speaker and mic on one sound card (one clock).
 echo_cancellation = true
-echo_model = "models/localvqe-pi-aec-v1-49k-f32.gguf"
+# Two LocalVQE models: one removes our own speech (so «стоп» is heard over an
+# answer), the other music (so commands are heard over a song).
+echo_model = "models/localvqe-v1.4-aec-200K-f32.gguf"
+echo_music_model = "models/localvqe-pi-aec-v1-49k-f32.gguf"
 
 [music]
 # Audio files to play (subfolders too). Optional sidecars per file: NAME.json
 # {"title", "artist"} and NAME.txt with the lyrics (used to tell sung words
-# from your voice). Without a .json, the file's own tags are used.
+# from your voice when echo_cancellation is off). Without a .json, the file's
+# own tags are used.
 library = "music"
 # Where music comes from, in search order. "local" = the library, "radio" =
 # the stations below. Streaming services plug in as more providers (README).

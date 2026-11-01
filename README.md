@@ -2,7 +2,7 @@
 
 A homemade, Yandex-Station-style voice assistant. Speech recognition, the default LLM and speech synthesis run locally; weather and Wikipedia lookups use the internet. Explicit requests can escalate to a remote LLM or an external agent harness.
 
-The default character is a sarcastic Russian speaker woken by **«Эй, гптшка»** or **«Эй, колонка»**. It answers **«Чё такое?»** to a bare wake phrase. Russian and English commands are supported. Wake phrases live in `[wake] phrases`; the small always-on wake model also needs their spellings in `[gate] grammar` (see the comment there).
+The default character is a sarcastic Russian speaker woken by **«Эй, колонка»** (or just **«колонка»**). It answers **«Чё такое?»** to a bare wake phrase. Russian and English commands are supported. Wake phrases live in `[wake] phrases`; the small always-on wake model also needs their spellings in `[gate] grammar` (see the comment there). Use real words: a made-up wake word such as «гптшка» is biased into recognition everywhere, and Nemotron started hearing it in song names («газ гптшкат» for «Хас-Булат») and in loud music.
 
 ## Parts
 
@@ -32,10 +32,11 @@ models/silero/v5_6_ru.pt
 models/silero/v3_en.pt
 models/silero/vad.jit
 models/vosk-model-small-ru-0.22/
+models/localvqe-v1.4-aec-200K-f32.gguf
 models/localvqe-pi-aec-v1-49k-f32.gguf
 ```
 
-LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3 requires the llama.cpp build from this flake, not the older nixpkgs build. The embedding model is `embeddinggemma-2-Q8_0.gguf` from `ggml-org/embeddinggemma-2-GGUF`. The VAD file is `silero_vad.jit` from `snakers4/silero-vad`; the wake model is `vosk-model-small-ru-0.22` from `alphacephei.com/vosk/models`. The echo canceller is `localvqe-pi-aec-v1-49k-f32.gguf` from `LocalAI-io/LocalVQE` on Hugging Face; the flake builds its library.
+LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3 requires the llama.cpp build from this flake, not the older nixpkgs build. The embedding model is `embeddinggemma-2-Q8_0.gguf` from `ggml-org/embeddinggemma-2-GGUF`. The VAD file is `silero_vad.jit` from `snakers4/silero-vad`; the wake model is `vosk-model-small-ru-0.22` from `alphacephei.com/vosk/models`. The two echo-canceller models, `localvqe-v1.4-aec-200K-f32.gguf` and `localvqe-pi-aec-v1-49k-f32.gguf`, are from `LocalAI-io/LocalVQE` on Hugging Face; the flake builds their library.
 
 `alsa/speaker.conf` currently targets the Razer Kraken V3 X (`CARD=X`) and exposes shared `speaker_in`/`speaker_out` devices. Change the card there for standalone microphones or speakers, then re-enter `nix develop` (the dev shell copies the file). The capture period is 100 ms and the playback period 40 ms to keep idle CPU wakeups low. The current headset test setup plays the simulated user into the **right earcup**, near the microphone.
 
@@ -74,7 +75,7 @@ While a slow tool runs (web search, Wikipedia, weather, big model) the speaker s
 
 Say «включи музыку» (shuffle the library), «включи май бонни» (a song or artist; Cyrillic spellings of Latin titles work), «включи радио» or «включи радио секрет эйджент» (internet radio from `[music] radio`), then «пауза», «продолжи», «следующая», «предыдущая», «что играет?», «выключи музыку». Each needs the wake phrase, as on Yandex Station. Pause, resume and skip act silently. Anything vaguer goes to LFM3 through the `play_music` and `music_control` tools; when nothing matches, it gets the library's titles and can retry.
 
-The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title` and `artist`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. Lyrics are added to echo removal while the song plays, so sung words are not taken for your voice.
+The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title` and `artist`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. With `echo_cancellation = false`, lyrics are added to echo removal while the song plays, so sung words are not taken for your voice. With it on, the canceller removes the singer, and lyric words in a transcript are yours («включи хас булат удалой» over Хас-Булат).
 
 `music/` is not in git. The test library is four public-domain recordings with vocals from Wikimedia Commons, each with lyrics and metadata sidecars:
 
@@ -104,11 +105,18 @@ Register it next to `LocalLibrary` and `Radio` in `Music.__init__` and add its n
 
 ### Echo cancellation
 
-With `[audio] echo_cancellation = true` (the default), the mic signal passes through [LocalVQE](https://github.com/localai-org/LocalVQE) before the wake gate and ASR see it. LocalVQE is a small neural echo canceller (an adaptive filter plus a 49K-parameter GTCRN mask, `[audio] echo_model`), trained on double talk. It subtracts what the speaker itself plays (music, answers, sounds) and keeps the user's voice. Every output stream records its audio, resampled to 16 kHz, on a shared timeline counted in samples (`speaker/voice/echo.py`), so the reference lines up with the mic to within a few milliseconds. LocalVQE finds the remaining delay itself. The flake builds `liblocalvqe.so`, and the voice service calls it through ctypes, delaying the mic by one 16 ms hop.
+With `[audio] echo_cancellation = true` (the default), the mic signal passes through [LocalVQE](https://github.com/localai-org/LocalVQE) before the wake gate and ASR see it. LocalVQE is a small neural echo canceller (an adaptive filter followed by a neural mask, trained on double talk). It subtracts what the speaker itself plays (music, answers, sounds) and keeps the user's voice. Every output stream records its audio, resampled to 16 kHz, on a shared timeline counted in samples (`speaker/voice/echo.py`), so the reference lines up with the mic to within a few milliseconds. LocalVQE finds the remaining delay itself. The flake builds `liblocalvqe.so`, and the voice service calls it through ctypes, delaying the mic by one 16 ms hop.
 
-It runs only while something plays, plus 1 s for the room's echo: about 1 ms of CPU per 16 ms hop (6.5% of one core). Otherwise the mic passes through unchanged, and the voice service idles at about 1% CPU.
+Two models run, one at a time, because each failed where the other worked:
 
-Measured through the real capture and playback path, with a recorded «Эй, колонка, поставь на паузу» played over each song from the same earcup. The loud test track is Bostaurus, «Will Bullets Stop The Violence» (2006, hardcore rock mastered at −8 LUFS; [CC BY-NC-ND 2.0 DE](https://archive.org/details/Bostaurus.Demo)), saved locally as `music/bostaurus-will-bullets.mp3`:
+| Test, same mic | v1.4-AEC 200K (`echo_model`) | pi-AEC 49K (`echo_music_model`) | No cancellation |
+|---|---|---|---|
+| «стоп» over a long spoken answer | 3/4 | 0/4 | 0/4 |
+| «Эй, колонка, что играет?» over Bostaurus at volume 7, in the service | 2/12 | 27/30 | — |
+
+While our own speech or a sound plays (and for 1 s after), the 200K model runs: 1.4 ms of CPU per 16 ms hop, 9% of one core. While only music plays, the 49K model runs: 1.1 ms per hop, 7%. Otherwise the mic passes through unchanged, and the voice service idles at about 1% CPU. In the service, «стоп» or «хватит» then stopped 5 of 5 long answers, one of them over playing music.
+
+Music measurements with the 49K model went through the real capture and playback path, with a recorded «Эй, колонка, поставь на паузу» played over each song from the same earcup. The loud test track is Bostaurus, «Will Bullets Stop The Violence» (2006, hardcore rock mastered at −8 LUFS; [CC BY-NC-ND 2.0 DE](https://archive.org/details/Bostaurus.Demo)), saved locally as `music/bostaurus-will-bullets.mp3`:
 
 | Song, volume | Music at the mic (the voice is −34 dBFS) | Music removed | Wake phrase verified, raw / cancelled |
 |---|---|---|---|
@@ -118,11 +126,11 @@ Measured through the real capture and playback path, with a recorded «Эй, к�
 | Bostaurus, 7 | −32 dBFS | 14 dB | ✗ / ✓ |
 | Bostaurus, 10 | −23 dBFS | 13 dB | ✗ / ✗ |
 
-Through the running service, with six «Эй, колонка, что играет?» per run, Bostaurus at volume 7 was answered 15 times out of 18 over three runs. At volume 10 it was answered 3 times out of 18. There the voice is 10 dB below the music at the mic, the speech detector never fires even after cancellation, and the music is never turned down.
+At volume 10, the service answered «Эй, колонка, что играет?» over Bostaurus 3 times out of 24. There the voice is 10 dB below the music at the mic, the speech detector never fires even after cancellation, and the music is never turned down.
 
 WebRTC's AEC3 was tried first and dropped. Its echo suppressor also removed the user's voice: with Хас-Булат at volume 5, only 47% of the voice was left. With Bostaurus at volume 7, 34% was left, and recognition failed where the raw mic still worked.
 
-Lyrics and spoken answers stay in the text-level echo removal as a second line of defence. Set `echo_cancellation = false` if the output and input are different sound cards: their clocks drift apart, so the reference no longer lines up with the mic.
+Spoken answers stay in the text-level echo removal as a second line of defence. A wake phrase that comes after our own echoed words is dropped as one of them misheard («Я расскажу тебе длинную колонка» for «…длинную сказку»). Set `echo_cancellation = false` if the output and input are different sound cards: their clocks drift apart, so the reference no longer lines up with the mic.
 
 ### Personal memory
 

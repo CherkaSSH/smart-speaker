@@ -45,7 +45,8 @@ SCHEMAS = [
          "day": {"type": "string", "enum": ["now", "today", "tomorrow", "day_after_tomorrow"]}}),
     _fn("lookup", "Look up facts on Wikipedia: people, places, history, science, books, films. "
         "Use it for any factual question instead of guessing.",
-        {"query": {"type": "string", "description": "Short search query, e.g. 'Война и мир роман'"},
+        {"query": {"type": "string", "description": "Only the subject's name in the nominative case, as a Wikipedia "
+                                                    "article title, e.g. 'Луна' or 'Война и мир'"},
          "lang": {"type": "string", "enum": ["ru", "en"]}},
         ["query"]),
     _fn("calculate", "Evaluate arithmetic exactly. Use for any calculation, including dates.",
