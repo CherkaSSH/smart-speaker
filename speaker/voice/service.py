@@ -27,7 +27,9 @@ from ..lang import detect
 from . import sounds
 from .asr import ASR, Final
 from .audio import Mic, Player
+from .echo import EchoCanceller, Reference
 from .gate import Gate
+from .music import MusicPlayer
 from .tts import TTS, normalize
 from .wake import WakeMatcher, phonetic, words
 
@@ -41,6 +43,7 @@ ECHO_RESIDUE_WORDS = 2  # after removing our voice, this few leftover words are 
 CONVERSATION_STATES = {"listening", "speaking", "thinking", "ringing"}
 RING_SECONDS = 60
 ECHO_TAIL = 0.5  # seconds after our last sound that the mic may still hear it (buffers, room echo)
+TALK_HOLD = 2.5  # seconds the music stays ducked after the user was last heard over it
 
 
 class Voice:
@@ -52,21 +55,27 @@ class Voice:
         self.brain_url = v["brain_url"]
         self.wake = WakeMatcher(w["phrases"], float(w["threshold"]))
         self.stop_words = {" ".join(words(s)) for s in w["stop_words"]}
-        self.player = Player(cfg["audio"], loop)
+        # One record of everything we play, so the mic can subtract it (echo cancellation).
+        self.reference = Reference() if cfg["audio"]["echo_cancellation"] else None
+        self.player = Player(cfg["audio"], loop, self.reference)
+        self.music = MusicPlayer(cfg["audio"], cfg["music"], loop, self.on_music_event, self.reference)
+        self.talk_until = 0.0  # the user is talking over the music until then: keep it ducked
+        self._music_start: asyncio.Task | None = None
         a = cfg["asr"]
         self.asr = ASR("main", a, a["language"], w["phrases"], float(w["boost"]), self.on_partial, self.on_main_final)
         self.asr_alt = ASR("auto", a, "auto", [], 0, None, self.on_alt_final) if a["detect_english"] else None
         self.streams = [self.asr] + ([self.asr_alt] if self.asr_alt else [])
         self.tts = TTS(cfg, cfg["tts"])
-        self.gate = Gate(cfg, self.on_small_wake, lambda: self.player.last_sound + ECHO_TAIL) \
-            if cfg["gate"]["enabled"] else None
+        self.gate = Gate(cfg, self.on_small_wake, lambda: self.player.last_sound + ECHO_TAIL,
+                         self.music.level, self.on_user_talking) if cfg["gate"]["enabled"] else None
         self.recognition_active = self.gate is None
         if self.gate:
             for stream in self.streams:
                 stream.active = False
         self.mic = Mic(cfg["audio"], loop,
                        [self.gate.audio] if self.gate else [s.audio for s in self.streams],
-                       self.streams if self.gate else [])
+                       self.streams if self.gate else [],
+                       EchoCanceller(self.reference) if self.reference else None)
         self.acks = {lang: self.tts.synth(text) for lang, text in cfg["character"]["ack"].items()}
         self.ack_texts = cfg["character"]["ack"]
 
@@ -97,6 +106,7 @@ class Voice:
             log.info("large ASR %s", "active" if active else "idle")
             if not active:
                 self.gate.reset()
+            self._update_duck()
         wanted = [(self.asr, active)]
         if self.asr_alt:
             wanted.append((self.asr_alt, active and self.state in CONVERSATION_STATES))
@@ -116,6 +126,18 @@ class Voice:
             log.info("%s -> %s%s", self.state, state, f" ({why})" if why else "")
             self.state = state
             self._set_streams_active(state != "idle")
+            self._update_duck()
+
+    def _update_duck(self) -> None:
+        """Music is quiet whenever we listen to or talk with the user."""
+        self.music.duck(self.state != "idle" or self.recognition_active or self.player.playing
+                        or time.monotonic() < self.talk_until)
+
+    def on_user_talking(self) -> None:
+        if self.music.state == "playing" and time.monotonic() >= self.talk_until:
+            log.info("user talking over the music: ducking")
+        self.talk_until = time.monotonic() + TALK_HOLD
+        self._update_duck()
 
     def play(self, audio: np.ndarray, rate: int, text: str = "") -> None:
         if not len(audio):
@@ -147,6 +169,8 @@ class Voice:
         heard = [w for group in forms for w in group]
         said = {w for start, end, ws in self.spoken
                 if f.start < end + 0.5 and f.end > start - 0.3 for w in ws}
+        if self.music.state == "playing":
+            said |= self.music.lyric_words  # the singer is not the user
 
         def echoed(w: str) -> bool:
             # ASR garbles our voice a little: "долла" for "доллара", "десятое" for "десятая".
@@ -318,7 +342,10 @@ class Voice:
         kind = msg.get("type")
         if kind == "volume":
             self.player.set_volume(int(msg["level"]))
+            self.music.set_volume(int(msg["level"]))
             log.info("volume %s", msg["level"])
+        elif kind == "music":
+            await self.on_music_command(msg)
         elif kind == "say" and msg.get("id") == self.turn_id:
             await self.speech.put((msg["id"], msg["text"], False))
         elif kind == "turn_end" and msg.get("id") == self.turn_id:
@@ -326,6 +353,33 @@ class Voice:
         elif kind == "ring":
             await self.interrupt("ring")
             self.ring_task = asyncio.create_task(self.ring(msg["text"]))
+
+    async def on_music_command(self, msg: dict) -> None:
+        action = msg["action"]
+        if self._music_start and not self._music_start.done():
+            self._music_start.cancel()  # a newer command wins over a track still waiting to start
+        if action == "play":
+            self._music_start = asyncio.create_task(self._start_music(msg["track"]))
+        elif action == "pause":
+            self.music.pause()
+        elif action == "resume":
+            self.music.resume()
+        elif action == "stop":
+            self.music.stop()
+        self._update_duck()
+
+    async def _start_music(self, track: dict) -> None:
+        # Let the answer ("Включаю ...") finish before the song starts.
+        deadline = time.monotonic() + 15
+        await asyncio.sleep(0.3)
+        while (self.turn_id is not None or self.player.playing) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        self.music.play(track)
+        self._update_duck()
+
+    async def on_music_event(self, event: str, track: dict, detail: str) -> None:
+        log.info("music %s: %s %s", event, track.get("title"), detail[:120])
+        await self.send({"type": "music_event", "event": event, "id": track["id"], "detail": detail})
 
     async def speaker(self) -> None:
         """Synthesize answer sentences in order, ahead of playback."""
@@ -376,6 +430,7 @@ class Voice:
         """Close the listening window when nobody speaks."""
         while True:
             await asyncio.sleep(0.2)
+            self._update_duck()  # speech playback and the talk hold end on their own
             if self.state == "listening" and time.monotonic() > self.listen_until and not self.player.playing:
                 self.play(sounds.listen_end(), sounds.RATE)
                 self.set_state("idle", "nobody spoke")
@@ -409,6 +464,7 @@ class Voice:
         finally:
             self.mic.stop()
             self.player.close()
+            self.music.close()
 
 
 async def run(cfg: Config) -> None:

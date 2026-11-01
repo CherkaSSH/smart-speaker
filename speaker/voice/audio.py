@@ -7,10 +7,14 @@ import logging
 import threading
 import time
 from collections import deque
+from typing import TYPE_CHECKING
 
 import numpy as np
 import sounddevice as sd
 import soxr
+
+if TYPE_CHECKING:
+    from .echo import EchoCanceller, Reference
 
 log = logging.getLogger("voice.audio")
 
@@ -34,11 +38,48 @@ def volume_gain(level: int) -> float:
     return 0.0 if level <= 0 else 10 ** ((min(level, 10) - 10) * 3 / 20)
 
 
+class TimedResampler:
+    """One stream's audio as 16 kHz mono, each output chunk dated by sample count.
+
+    An echo canceller needs the mic and the speaker reference aligned to the sample.
+    Callback timestamps jitter by tens of milliseconds, and soxr returns output in
+    bursts (490, 979, ... samples for 640 expected), so chunks are dated from one
+    anchor plus the number of output samples so far. All streams of one sound card
+    share its clock, and both paths share soxr's delay, so they stay aligned.
+    """
+
+    RESYNC = 0.05  # re-anchor when counting drifts this far from PortAudio's time (an xrun)
+
+    def __init__(self, in_rate: int):
+        self.in_rate = in_rate
+        self.stream = soxr.ResampleStream(in_rate, ASR_RATE, 1, dtype="float32") if in_rate != ASR_RATE else None
+        self.anchor: float | None = None
+        self.frames_in = 0
+        self.samples_out = 0
+
+    def __call__(self, block: np.ndarray, measured: float) -> tuple[np.ndarray, float]:
+        """(16 kHz mono, time of its first sample). `measured` is PortAudio's time of the block."""
+        if self.anchor is None or abs(self.anchor + self.frames_in / self.in_rate - measured) > self.RESYNC:
+            self.anchor = measured - self.frames_in / self.in_rate
+        mono = block.mean(axis=1) if block.ndim == 2 else block
+        self.frames_in += len(mono)
+        out = self.stream.resample_chunk(np.ascontiguousarray(mono, np.float32)) if self.stream else mono
+        start = self.anchor + self.samples_out / ASR_RATE
+        self.samples_out += len(out)
+        return out, start
+
+
+def dac_time(t) -> float:
+    """PortAudio's estimate of when an output block reaches the speaker, as monotonic time."""
+    now = time.monotonic()
+    return now + (t.outputBufferDacTime - t.currentTime) if t.outputBufferDacTime else now
+
+
 class Mic:
     """Pushes (capture_time, pcm16 bytes) chunks of ~100 ms at 16 kHz into asyncio queues."""
 
     def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop, queues: list[asyncio.Queue],
-                 gated_streams: list | None = None):
+                 gated_streams: list | None = None, echo: "EchoCanceller | None" = None):
         self.rate = int(cfg["input_rate"])
         self.gain = float(cfg["mic_gain"])
         self.device = find_device(cfg["input_device"], "input")
@@ -47,16 +88,20 @@ class Mic:
         self.queues = queues
         self.gated_streams = gated_streams or []
         self._loop = loop
-        # Only needed when the device can't capture at the ASR rate itself.
-        self._resampler = soxr.ResampleStream(self.rate, ASR_RATE, 1, dtype="float32") \
-            if self.rate != ASR_RATE else None
+        self.echo = echo  # removes our own speech and music from the mic signal
+        self._timed = TimedResampler(self.rate)
         self._stream = sd.InputStream(device=self.device, samplerate=self.rate, channels=self.channels,
                                       dtype="float32", blocksize=self.rate // 10, callback=self._callback)
 
     def _callback(self, data, frames, t, status) -> None:
-        captured = time.monotonic() - frames / self.rate
-        mono = data.mean(axis=1) * self.gain
-        pcm = self._resampler.resample_chunk(mono) if self._resampler else mono
+        now = time.monotonic()
+        # PortAudio's ADC time is when the first frame was captured.
+        measured = now - (t.currentTime - t.inputBufferAdcTime) if t.inputBufferAdcTime else now - frames / self.rate
+        pcm, captured = self._timed(data * self.gain, measured)
+        if not len(pcm):
+            return
+        if self.echo is not None:
+            pcm = self.echo.process(pcm, captured)
         pcm16 = (np.clip(pcm, -1, 1) * 32767).astype(np.int16).tobytes()
         try:
             self._loop.call_soon_threadsafe(self._push, (captured, pcm16))
@@ -87,7 +132,8 @@ class Mic:
 class Player:
     """Plays queued clips; `stop()` silences instantly. Remembers when it last made sound."""
 
-    def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop):
+    def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop, reference: "Reference | None" = None):
+        self.reference = reference  # what we play, for echo cancellation
         self.rate = int(cfg["sample_rate"])
         self.device = find_device(cfg["output_device"], "output")
         info = sd.query_devices(self.device, "output")
@@ -126,6 +172,8 @@ class Player:
             empty = not self._clips
         if written:
             self.last_sound = time.monotonic() + written / self.rate
+        if self.reference is not None:
+            self.reference.add(*self._timed(out, dac_time(t)))
         if empty and not self._idle.is_set():
             self._loop.call_soon_threadsafe(self._mark_idle)
 
@@ -166,6 +214,7 @@ class Player:
             self._pause_timer.cancel()
             self._pause_timer = None
         if self._stream is None:
+            self._timed = TimedResampler(self.rate)  # a new stream counts its own samples
             self._stream = sd.OutputStream(device=self.device, samplerate=self.rate, channels=self.channels,
                                            dtype="float32", blocksize=self.rate // 50, callback=self._callback)
             self._stream.start()

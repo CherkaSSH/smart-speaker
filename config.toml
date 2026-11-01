@@ -60,6 +60,24 @@ output_channels = [0, 1]
 mic_gain = 4.0
 # Initial volume 0..10, like Yandex Station. Changed by voice later.
 volume = 6
+# Subtract what the speaker plays (answers, music) from the mic with WebRTC's
+# AEC3 echo canceller, so the wake word and commands are heard over it.
+echo_cancellation = true
+
+[music]
+# Audio files to play (subfolders too). Optional sidecars per file: NAME.json
+# {"title", "artist"} and NAME.txt with the lyrics (used to tell sung words
+# from your voice). Without a .json, the file's own tags are used.
+library = "music"
+# Where music comes from, in search order. "local" = the library, "radio" =
+# the stations below. Streaming services plug in as more providers (README).
+providers = ["local", "radio"]
+# Music volume while you talk or the speaker answers (fraction of normal).
+duck_volume = 0.2
+# You are talking over the music when the mic is this many times louder than
+# the music alone would make it (2.0 = 6 dB).
+talk_factor = 2.0
+radio = { "Groove Salad" = "https://ice1.somafm.com/groovesalad-128-mp3", "Secret Agent" = "https://ice1.somafm.com/secretagent-128-mp3" }
 
 [asr]
 url = "ws://127.0.0.1:8090/v1/audio/transcriptions/realtime"

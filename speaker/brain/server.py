@@ -32,6 +32,7 @@ from . import intents, speech
 from .escalate import Harness, RemoteLLM
 from .llm import LLM
 from .memory import Memory
+from .music import Music
 from .timers import Item, Scheduler
 from .tools import BIG_MODEL_SCHEMA, SCHEMAS, WEB_SEARCH_SCHEMA, Tools
 from .websearch import WebSearch
@@ -94,7 +95,8 @@ You are the voice of a home smart speaker, like Yandex Station's Alice. Everythi
 - When ask_big_model is available, use it for requests beyond your reasoning or knowledge ability; the user is asked to confirm first.
 - For current events, news, prices, schedules or anything else Wikipedia wouldn't have, call web_search with an English objective and English queries, then answer from the results in the reply language.
 - Each user message starts with the current date, time and reply language in square brackets. Don't mention the date or time unless asked.
-- You can't play music or control other devices; say so briefly if asked.
+- For music use play_music (a song, artist, "some music" or a radio station) and music_control (pause, resume, next, previous, stop).
+- You can't control other devices (lights, TV); say so briefly if asked.
 """
 
 # Said while a slow tool runs, unless the model already said something first.
@@ -129,6 +131,7 @@ class Brain:
         self.big_triggers = r["triggers"]
         self.harness_triggers = h["triggers"]
         self.web = WebSearch(cfg["web_search"])
+        self.music = Music(self, cfg["music"], cfg.file(cfg["music"]["library"]))
         self.confirm_big = bool(r["confirm"])
         self.offer_big_for_search = bool(cfg["web_search"]["offer_big_model"])
         self.schemas = SCHEMAS + ([WEB_SEARCH_SCHEMA] if self.web.enabled else []) \
@@ -242,9 +245,10 @@ class Brain:
             return
         if self.fast_commands:
             reply = await intents.handle(self, text, lang)
-            if reply:
+            if reply is not None:
                 log.info("fast command: %r -> %r", text, reply)
-                yield reply
+                if reply:  # "" = done silently (pausing music)
+                    yield reply
                 return
         # No conversation history: background speech and old topics must never
         # influence this request. Only timers, alarms, volume and explicitly
@@ -367,6 +371,8 @@ class Brain:
                     self.start_turn(d.get("id") or uuid.uuid4().hex[:8], d["text"], d.get("lang", "ru"))
                 elif kind == "cancel":
                     self.cancel_turn()
+                elif kind == "music_event":
+                    await self.music.on_event(d["event"], d["id"], d.get("detail", ""))
         finally:
             self.clients.discard(ws)
             log.info("voice disconnected")

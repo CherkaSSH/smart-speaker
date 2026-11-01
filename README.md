@@ -2,11 +2,11 @@
 
 A homemade, Yandex-Station-style voice assistant. Speech recognition, the default LLM and speech synthesis run locally; weather and Wikipedia lookups use the internet. Explicit requests can escalate to a remote LLM or an external agent harness.
 
-The default character is a sarcastic Russian speaker woken by **«Эй, долбаёб»**. It answers **«Чё надо?»** to a bare wake phrase. Russian and English commands are supported.
+The default character is a sarcastic Russian speaker woken by **«Эй, гптшка»** or **«Эй, колонка»**. It answers **«Чё такое?»** to a bare wake phrase. Russian and English commands are supported. Wake phrases live in `[wake] phrases`; the small always-on wake model also needs their spellings in `[gate] grammar` (see the comment there).
 
 ## Parts
 
-- **Voice** (`speaker/voice/`): microphone capture, wake/stop phrases, echo rejection, barge-in, follow-up listening and Silero TTS playback. The output device is opened only while something plays.
+- **Voice** (`speaker/voice/`): microphone capture, acoustic echo cancellation, wake/stop phrases, echo rejection, barge-in, follow-up listening and Silero TTS playback. The output device is opened only while something plays.
 - **Speech gate** (`speaker/voice/gate.py`): an energy check and Silero VAD (~2 MB) skip silence, and Vosk small Russian (~50 MB) detects the wake phrase. Two seconds of pre-roll preserve the complete command. Our own playback (plus a 0.5 s tail) is ignored so answers can't wake the speaker.
 - **ASR**: Nemotron 0.6B streaming through `nemo-speech`, on the Radeon iGPU via Vulkan. It activates after the small wake gate and stays active during an answer or ring. A Russian stream verifies the wake phrase and handles Russian commands; an optional auto-detect stream handles English once a conversation is open.
 - **Brain** (`speaker/brain/`): LFM3-1.7B through `llama-server` on the Radeon iGPU, with timers, alarms, volume, arithmetic, weather and Wikipedia tools. Common commands bypass the LLM. Optional escalation streams a larger OpenAI-compatible API model or runs a real agent command. Personal memory uses EmbeddingGemma 2 semantic search through a second `llama-server`.
@@ -69,6 +69,52 @@ When the big model is configured, a web search first asks «Ищу в интер
 
 While a slow tool runs (web search, Wikipedia, weather, big model) the speaker says a short line first («Сейчас поищу», «Сейчас гляну», «Смотрю погоду»), then continues with the answer.
 
+### Music
+
+Say «включи музыку» (shuffle the library), «включи май бонни» (a song or artist; Cyrillic spellings of Latin titles work), «включи радио» or «включи радио секрет эйджент» (internet radio from `[music] radio`), then «пауза», «продолжи», «следующая», «предыдущая», «что играет?», «выключи музыку». Each needs the wake phrase, as on Yandex Station. Pause, resume and skip act silently. Anything vaguer goes to LFM3 through the `play_music` and `music_control` tools; when nothing matches, it gets the library's titles and can retry.
+
+The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title` and `artist`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. Lyrics are added to echo removal while the song plays, so sung words are not taken for your voice.
+
+`music/` is not in git. The test library is four public-domain recordings with vocals from Wikimedia Commons, each with lyrics and metadata sidecars:
+
+| File | Song | Performer | Year | License on Commons |
+|---|---|---|---|---|
+| `my-bonnie-lies-over-the-ocean.mp3` | My Bonnie Lies Over the Ocean | Haydn Quartet | 1901 | PD-US-record-expired |
+| `shine-on-harvest-moon.ogg` | Shine On, Harvest Moon (unrestored) | Ada Jones and Billy Murray | 1909 | PD-US-record-expired |
+| `ey-ukhnem.ogg` | Эй, ухнем! | Фёдор Шаляпин | 1902 | PD-RusEmpire |
+| `khas-bulat.mp3` | Хас-Булат удалой | Надежда Плевицкая | 1909 | PD-RusEmpire |
+
+Each `.json` sidecar records the source and lyrics URLs. The Russian lyrics are the full song texts; the old discs may sing fewer verses.
+
+Music turns down to `duck_volume` while the speaker listens, thinks or answers, and when you start talking over it: the wake gate learns how loud the music normally sounds in the mic and ducks it when the mic gets `talk_factor` times louder than that while it hears speech. That lowers the music before the wake phrase is even recognized.
+
+#### Adding a streaming service
+
+Playback takes anything ffmpeg can open, including HTTP and HLS stream URLs, so a streaming service is only a provider in `speaker/brain/music.py` with two methods:
+
+```python
+class YandexMusic:
+    name = "yandex"
+    async def search(self, query: str, limit: int) -> list[Track]: ...  # the service's search API
+    async def resolve(self, track: Track) -> str: ...                    # a fresh stream URL for this track
+```
+
+Register it next to `LocalLibrary` and `Radio` in `Music.__init__` and add its name to `[music] providers`; credentials belong in an environment variable, like the other API keys. `resolve()` runs right before each track plays, so expiring stream URLs stay valid, and the voice service needs no changes. Spotify is the exception: it doesn't hand out stream URLs, so it would need a Spotify Connect receiver such as librespot instead.
+
+### Echo cancellation
+
+With `[audio] echo_cancellation = true` (the default), the mic signal passes through WebRTC's AEC3 ([pywebrtc-audio](https://pypi.org/project/pywebrtc-audio/)) before the wake gate and ASR see it. AEC3 subtracts what the speaker itself plays: music, answers and sounds. Every output stream records its audio, resampled to 16 kHz, on a shared timeline counted in samples (`speaker/voice/echo.py`), so the reference lines up with the mic to within a few milliseconds. AEC3 finds the remaining delay itself.
+
+Measured with the test songs at volume 5 and a recorded «Эй, колонка, поставь на паузу» played over them, three runs per song:
+
+| Song | Music in mic, raw → cancelled | Wake phrase verified, raw / cancelled |
+|---|---|---|
+| My Bonnie | 0.0069 → 0.0008 RMS (−19 dB) | 0/3 / 2/3 |
+| Эй, ухнем | 0.0014 → 0.0006 RMS (−8 dB) | 3/3 / 2/3 |
+| Хас-Булат | 0.0160 → 0.0008 RMS (−26 dB) | 3/3 / 3/3 |
+
+The raw mic also put sung words into the command («Майболи добры одну хитрой колонка, поставь на паузу»); the cancelled mic didn't. The one cancelled miss was «Ei koloнka», which Nemotron wrote in mixed scripts. The canceller costs about 0.6 ms of CPU per 100 ms of audio. Lyrics and spoken answers stay in the text-level echo removal as a second line of defence. Set `echo_cancellation = false` if the output and input are different sound cards: their clocks drift apart, so the reference no longer lines up with the mic.
+
 ### Personal memory
 
 `save_memory` and `search_memory` let LFM3 persist durable facts and retrieve them when relevant. For example, say **«запомни, что я люблю овсяное молоко»**, then later ask what milk you prefer. Text and normalized 768-dimensional embeddings are stored in `state/memory.sqlite3`.
@@ -114,11 +160,11 @@ Opens `config.toml` in a terminal editor: sections on the left, fields on the ri
 
 ## Voice behavior
 
-- Say **«Эй, долбаёб, поставь таймер на пять минут»**, or say the wake phrase alone and wait for the acknowledgement.
+- Say **«Эй, колонка, поставь таймер на пять минут»**, or say the wake phrase alone and wait for the acknowledgement.
 - During speech or a ringing timer, any speech interrupts and becomes the next command; the wake phrase is not needed. A short **«стоп»**, **«хватит»** or another configured stop word just stops the response.
 - Ordinary answers return to idle. A follow-up without the wake phrase is accepted only when the speaker explicitly asked you a question. Requests have no conversation history; only timers, alarms and volume persist.
 - Start with **«спроси большую модель»** to use `[remote_llm]`, or **«запусти агента»** to run `[harness]`. English triggers are also configured.
 - Volume commands use levels 0–10. Timers and alarms persist in `state/brain.json`; personal memories persist in `state/memory.sqlite3`.
-- Music playback and smart-home control are not implemented.
+- Smart-home control is not implemented.
 
 Tune wake matching, stop words, microphone gain, output channels, TTS voices, endpoint silence, the 4096-token generation ceiling, escalation backends and the character prompt in `config.toml`, by hand or with `speaker settings`.

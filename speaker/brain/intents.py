@@ -146,6 +146,11 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
             return "Осталось " + ", и ".join(left) + "."
         return " and ".join(left) + " left."
 
+    # Music -------------------------------------------------------------
+    reply = await _music(brain, t, words, ru)
+    if reply is not None:
+        return reply
+
     # Clock -------------------------------------------------------------
     now = dt.datetime.now()
     if len(words) <= 6 and _has(t, r"\b(который час|сколько (сейчас )?времени|what time is it|what s the time|whats the time)\b"):
@@ -157,4 +162,59 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
             day = day[:-2] + ("ье" if day.endswith("ий") else "ое")  # "тридцать первое", "третье"
             return f"Сегодня {_RU_WEEKDAYS[now.weekday()]}, {day} {_RU_MONTHS[now.month - 1]}."
         return f"Today is {now:%A, %B} {speech.num2words(now.day, to='ordinal')}."
+    return None
+
+
+_PLAY = r"^(включи|поставь|сыграй|играй|запусти|play|put on)\b ?(.*)$"
+_FILLER = r"\b(мне|пожалуйста|please|какую нибудь|какую-нибудь|что нибудь|что-нибудь|some|the|a|музыку|музыка|music|" \
+          r"песню|песня|song|трек|track)\b"
+_DEVICES = r"\b(свет\w*|ламп\w*|телевизор\w*|тв|чайник\w*|кондиционер\w*|отоплени\w*|обогрев\w*|пылесос\w*|" \
+           r"розетк\w*|light\w*|lamp\w*|tv|television|kettle|heater|vacuum)\b"
+
+
+async def _music(brain: "Brain", t: str, words: list[str], ru: bool) -> str | None:
+    """Music commands. "" means done silently: pausing shouldn't talk over the song."""
+    music = brain.music
+    short = len(words) <= 5
+    active = music.state != "stopped"
+
+    async def control(action: str, nothing: tuple[str, str]) -> str:
+        return "" if await music.control(action) else nothing[0 if ru else 1]
+
+    if short and _has(t, r"\b(пауз\w*|pause)\b"):
+        return await control("pause", ("Ничего не играет.", "Nothing is playing."))
+    if short and _has(t, r"\b(продолж\w*|сними (с )?паузу?|играй дальше|resume|continue|unpause)\b"):
+        return await control("resume", ("Нечего продолжать.", "Nothing to resume."))
+    if short and (_has(t, r"\b(следующ\w*|next|skip)\b") or active and _has(t, r"^(дальше|переключи\w*)$")):
+        return await control("next", ("Это была последняя.", "That was the last one."))
+    if short and _has(t, r"\b(предыдущ\w*|прошл\w* (песн\w*|трек\w*)|previous)\b"):
+        return await control("previous", ("Раньше ничего не было.", "There's nothing before this."))
+    if short and (_has(t, r"\b(выключи\w*|останови\w*|стоп|хватит|stop|turn off)\b.*\b(музык\w*|песн\w*|радио|music|song|radio)\b")
+                  or active and _has(t, r"^(выключи|выключай|останови|stop it|turn it off)$")):
+        return await control("stop", ("Музыка и так не играет.", "No music is playing."))
+    if _has(t, r"\b(что (сейчас |это )?(играет|за песня|звучит)|какая (это |сейчас )?песня|what s playing|what is playing|what song)\b"):
+        cur = music.current
+        if cur is None:
+            return "Сейчас ничего не играет." if ru else "Nothing is playing."
+        return f"Это {cur.label('ru')}." if ru else f"This is {cur.label('en')}."
+    m = re.search(_PLAY, t)
+    if m:
+        rest = re.sub(_FILLER, " ", m.group(2))
+        radio = _has(rest, r"\b(радио|radio)\b")
+        query = re.sub(r"\s+", " ", rest).strip()
+        station = re.sub(r"\b(радио|radio)\b", "", query).strip()
+        if _has(query, _DEVICES):
+            return None  # "включи свет": the LLM explains it can't control devices
+        if not brain.clients:
+            return "Голосовой модуль не подключён." if ru else "The voice service is not connected."
+        track = await music.play(station if radio else query, radio)
+        if track is None:
+            if m.group(1) in ("поставь", "put on"):
+                return None  # "поставь напоминание ...": not necessarily music
+            return f"Не нашёл «{query}»." if ru else f"I couldn't find {query}."
+        if radio and not station:
+            return f"Включаю радио {track.title}." if ru else f"Playing {track.title} radio."
+        if not query:
+            return "Включаю музыку." if ru else "Playing some music."
+        return f"Включаю {track.label('ru')}." if ru else f"Playing {track.label('en')}."
     return None

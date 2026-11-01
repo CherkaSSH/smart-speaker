@@ -59,6 +59,11 @@ SCHEMAS = [
         "asks about preferences, past requests, or what you remember.",
         {"query": {"type": "string", "description": "What to find, in natural language"},
          "limit": {"type": "integer", "description": "Maximum results, 1-10; default 5"}}, ["query"]),
+    _fn("play_music", "Play music: a song, an artist, any music (empty query), or an internet radio station.",
+        {"query": {"type": "string", "description": "Song title or artist as the user said it; empty for any music"},
+         "radio": {"type": "boolean", "description": "True for an internet radio station"}}),
+    _fn("music_control", "Control the music that is playing.",
+        {"action": {"type": "string", "enum": ["pause", "resume", "next", "previous", "stop"]}}, ["action"]),
 ]
 
 WEB_SEARCH_SCHEMA = _fn(
@@ -280,3 +285,19 @@ class Tools:
             return {"error": "give an objective or a query"}
         return {"results": await self.brain.web.search(objective, queries),
                 "note": "Excerpts are in English; answer in the reply language."}
+
+    # Music -------------------------------------------------------------
+    async def t_play_music(self, query: str = "", radio: bool = False) -> dict:
+        if not self.brain.clients:
+            return {"error": "the voice service is not connected"}
+        track = await self.brain.music.play(query, bool(radio))
+        if track is None:
+            local = next((p for p in self.brain.music.providers if p.name == "local"), None)
+            known = local.titles()[:30] if local else []
+            return {"error": f"nothing found for {query!r}", "library": known,
+                    "stations": list(self.brain.cfg["music"].get("radio", {}))}
+        return {"playing": track.label(self.lang)}
+
+    async def t_music_control(self, action: str) -> dict:
+        ok = await self.brain.music.control(action)
+        return {"ok": ok, "state": self.brain.music.state}

@@ -21,6 +21,7 @@ from tomlkit.items import Comment, InlineTable, String, StringType, Whitespace
 # Which processes read each section, i.e. what must restart after editing it.
 USERS = {
     "character": ("brain", "voice"), "wake": ("voice",), "gate": ("voice",), "audio": ("voice", "brain"),
+    "music": ("brain", "voice"),
     "asr": ("asr", "voice"), "tts": ("voice",), "llm": ("llm", "brain"), "remote_llm": ("brain",),
     "harness": ("brain",), "web_search": ("brain",), "memory": ("embed", "brain"), "brain": ("brain",),
     "voice": ("voice",),

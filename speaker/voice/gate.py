@@ -25,12 +25,19 @@ RATE = 16000
 
 
 class Gate:
-    def __init__(self, cfg: Config, on_wake: Callable[[], Awaitable[None]], echo_until: Callable[[], float]):
+    def __init__(self, cfg: Config, on_wake: Callable[[], Awaitable[None]], echo_until: Callable[[], float],
+                 music_level: Callable[[float, float], float | None], on_talk: Callable[[], None]):
         g = cfg["gate"]
         self.on_wake = on_wake
         # Monotonic time until which the mic may still hear our own playback. The
         # restricted wake grammar would otherwise turn that echo into a false wake.
         self.echo_until = echo_until
+        # Talking over music: the mic is much louder than the music alone makes it.
+        self.music_level = music_level
+        self.on_talk = on_talk
+        self.talk_factor = float(cfg["music"]["talk_factor"])
+        self._ratios: deque[float] = deque(maxlen=150)  # mic/music loudness without the user, ~15 s
+        self._talk_streak = 0
         self.threshold = float(g["vad_threshold"])
         # Chunks quieter than this are silence without asking Silero VAD.
         self.energy_floor = float(g["energy_floor"])
@@ -69,6 +76,30 @@ class Gate:
                 probabilities.append(float(self.vad(torch.from_numpy(chunk), RATE)))
         return bool(probabilities) and max(probabilities) >= self.threshold
 
+    def _check_talk(self, captured: float, rms: float, speech: bool) -> None:
+        """Call on_talk when someone talks over our music.
+
+        The singer makes the VAD fire too, so speech alone means nothing here. The
+        mic level follows the music level by a fairly steady ratio (speaker volume,
+        room, mic gain, echo cancellation); the user's voice adds loudness the music
+        doesn't explain. Quiet chunks count too: after echo cancellation the music
+        left in the mic is often below the energy floor."""
+        # The mic hears blocks written up to ~0.3 s earlier (output buffers).
+        music = self.music_level(captured - 0.3, captured + 0.1)
+        if music is None or music < 1e-4:
+            self._talk_streak = 0
+            return
+        ratio = rms / music
+        if len(self._ratios) >= 20:
+            baseline = float(np.median(self._ratios))
+            if speech and ratio > self.talk_factor * baseline:
+                self._talk_streak += 1
+                if self._talk_streak >= 2:  # 200 ms: one loud beat in the song isn't talking
+                    self.on_talk()
+                return  # keep the user's voice out of the baseline
+        self._talk_streak = 0
+        self._ratios.append(ratio)
+
     async def run(self) -> None:
         while True:
             item = await self.audio.get()
@@ -79,11 +110,13 @@ class Gate:
             if captured < self.echo_until():
                 continue
             pcm = np.frombuffer(raw, np.int16).astype(np.float32) / 32768
-            if float(np.sqrt(np.mean(pcm * pcm))) < self.energy_floor:
+            rms = float(np.sqrt(np.mean(pcm * pcm)))
+            if rms < self.energy_floor:
                 speech = False
                 self._vad_pending = self._vad_pending[:0]  # VAD windows stay contiguous with real audio
             else:
                 speech = self._is_speech(pcm)
+            self._check_talk(captured, rms, speech)
             if speech:
                 self._quiet = 0
             else:

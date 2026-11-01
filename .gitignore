@@ -1,5 +1,7 @@
 # Model weights are downloaded separately (see README).
 /models/
+# Music library (audio files are large; see README for the test songs).
+/music/
 # Runtime state: timers, volume, personal memory.
 /state/
 .venv/
