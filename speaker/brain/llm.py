@@ -61,8 +61,12 @@ class LLM:
         return latin >= 4 and latin >= 0.6 * len(ws)
 
     async def respond(self, messages: list[dict], tools: list[dict], run_tool: ToolRunner, lang: str,
-                      max_rounds: int = 3) -> AsyncIterator[str]:
-        """Yield speakable sentences. `messages` is extended with the assistant turn(s)."""
+                      max_rounds: int = 3, preface: Callable[[str], str | None] | None = None) -> AsyncIterator[str]:
+        """Yield speakable sentences. `messages` is extended with the assistant turn(s).
+
+        Text the model writes before a tool call is spoken right away, and it keeps
+        talking after the result. LFM3 rarely writes any, so `preface(tool_name)` may
+        supply a short line ("Сейчас гляну.") to say while a slow tool runs."""
         for round_no in range(max_rounds):
             splitter = SentenceSplitter()
             content = ""  # what was actually said
@@ -110,6 +114,11 @@ class LLM:
                 except json.JSONDecodeError:
                     args = {}
                 parsed.append((c, args))
+            if not content.strip() and preface:
+                line = preface(parsed[0][0]["name"])
+                if line:
+                    content = line
+                    yield line
             # The LFM3 template wants tool-call arguments as a mapping, not a JSON string.
             messages.append({"role": "assistant", "content": content, "tool_calls": [
                 {"id": c["id"] or f"call_{i}", "type": "function",

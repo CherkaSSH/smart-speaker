@@ -61,6 +61,16 @@ SCHEMAS = [
          "limit": {"type": "integer", "description": "Maximum results, 1-10; default 5"}}, ["query"]),
 ]
 
+WEB_SEARCH_SCHEMA = _fn(
+    "web_search",
+    "Search the web for current or specific information: news, recent events, prices, schedules, opening hours, "
+    "or anything Wikipedia (lookup) wouldn't have. Write the objective and queries in English even when the user "
+    "speaks Russian; then answer in the reply language.",
+    {"objective": {"type": "string", "description": "One sentence in English: what to find out"},
+     "queries": {"type": "array", "items": {"type": "string"},
+                 "description": "1-3 English keyword queries of 3-6 words"}},
+    ["objective", "queries"])
+
 BIG_MODEL_SCHEMA = _fn(
     "ask_big_model",
     "Delegate difficult reasoning, coding, or synthesis to a larger remote model. Use automatically when the request "
@@ -255,7 +265,18 @@ class Tools:
     async def t_ask_big_model(self, question: str) -> dict:
         if not self.brain.remote or not self.brain.remote.configured:
             return {"error": "the big model is not configured"}
-        messages = [{"role": "system", "content": self.brain.system},
+        messages = [{"role": "system", "content": self.brain.remote_system},
                     {"role": "user", "content": f"{self.brain._stamp(self.lang)} {question}"}]
         answer = [sentence async for sentence in self.brain.remote.respond(messages)]
         return {"answer": " ".join(answer)}
+
+    async def t_web_search(self, objective: str = "", queries: list[str] | str | None = None, query: str = "") -> dict:
+        # Small models mix up the argument names; take whatever text they gave.
+        if isinstance(queries, str):
+            queries = [queries]
+        queries = [q for q in (queries or []) + [query] if q]
+        objective = objective or (queries[0] if queries else "")
+        if not objective:
+            return {"error": "give an objective or a query"}
+        return {"results": await self.brain.web.search(objective, queries),
+                "note": "Excerpts are in English; answer in the reply language."}

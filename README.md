@@ -40,7 +40,7 @@ LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3
 
 ### Optional escalation
 
-Both modes are disabled by default. With remote mode enabled, LFM3 can also invoke `ask_big_model` automatically for requests beyond its abilities; routine requests remain local.
+Both modes are disabled by default. With remote mode enabled, LFM3 can also call `ask_big_model` on its own for requests beyond its abilities. It then asks first («Это сложновато. Спросить большую модель?»): "да" sends the question to the big model, "нет" makes LFM3 answer itself. Any other request drops the question. Turn this off with `confirm = false`. Explicit requests («спроси большую модель…», `--big`) never ask.
 
 For a larger API model, set `enabled = true` in `[remote_llm]`, configure its OpenAI-compatible URL and model, and export the key:
 
@@ -60,6 +60,14 @@ speaker ask "Inspect this repository and summarize its architecture" --harness
 ```
 
 The harness supplies its own model authentication and tools. API and harness modes are mutually exclusive.
+
+### Web search
+
+LFM3 calls `web_search` for news, prices, schedules and other current information that Wikipedia (`lookup`) wouldn't have. It writes the search in English, and answers from the English excerpts in the user's language. Searches go to [Parallel](https://parallel.ai): without a key, its free hosted endpoint (about 1–2 s per search, lower rate limits); with `PARALLEL_API_KEY` set, its API in the configured `mode` (`turbo` takes about 0.2 s and needs English queries, which the tool already uses). Parallel can't cap spending, so `max_per_day` caps searches here.
+
+When the big model is configured, a web search first asks «Ищу в интернете. Пусть ответит большая модель?» while the search already runs: "да" lets the big model answer from the results, "нет" lets LFM3 answer. Set `offer_big_model = false` in `[web_search]` to always answer with LFM3.
+
+While a slow tool runs (web search, Wikipedia, weather, big model) the speaker says a short line first («Сейчас поищу», «Сейчас гляну», «Смотрю погоду»), then continues with the answer.
 
 ### Personal memory
 

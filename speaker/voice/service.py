@@ -28,7 +28,7 @@ from . import sounds
 from .asr import ASR, Final
 from .audio import Mic, Player
 from .gate import Gate
-from .tts import TTS
+from .tts import TTS, normalize
 from .wake import WakeMatcher, phonetic, words
 
 log = logging.getLogger("voice")
@@ -36,6 +36,8 @@ log = logging.getLogger("voice")
 # Our own voice reaching the mic is ignored when the transcript overlaps playback
 # and shares at least this fraction of words with what we said.
 ECHO_WORD_OVERLAP = 0.5
+ECHO_WORD_SIMILARITY = 0.75  # a heard word this close to one we said counts as our own voice
+ECHO_RESIDUE_WORDS = 2  # after removing our voice, this few leftover words are echo noise too
 CONVERSATION_STATES = {"listening", "speaking", "thinking", "ringing"}
 RING_SECONDS = 60
 ECHO_TAIL = 0.5  # seconds after our last sound that the mic may still hear it (buffers, room echo)
@@ -122,7 +124,10 @@ class Voice:
         start = max(now, self.play_end)
         self.play_end = start + len(audio) / rate
         if text:
-            self.spoken.append((start, self.play_end, [phonetic(x) for x in words(text)]))
+            # Match the words as they were spoken: "77 855" was said as "семьдесят семь
+            # восемьсот пятьдесят пять", which is what the mic transcript will contain.
+            said = words(text) + words(normalize(text, detect(text)))
+            self.spoken.append((start, self.play_end, [phonetic(x) for x in said]))
             self.spoken = [s for s in self.spoken if s[1] > now - 30]
         self.player.play(audio, rate)
 
@@ -142,10 +147,16 @@ class Voice:
         heard = [w for group in forms for w in group]
         said = {w for start, end, ws in self.spoken
                 if f.start < end + 0.5 and f.end > start - 0.3 for w in ws}
-        matched = sum(1 for group in forms if all(w in said for w in group))
-        if not heard or not said or matched / len(forms) < ECHO_WORD_OVERLAP:
+
+        def echoed(w: str) -> bool:
+            # ASR garbles our voice a little: "долла" for "доллара", "десятое" for "десятая".
+            return w in said or len(w) >= 4 and any(SequenceMatcher(None, w, s).ratio() >= ECHO_WORD_SIMILARITY
+                                                    for s in said if abs(len(s) - len(w)) <= 3)
+
+        is_echo = [all(echoed(w) for w in group) for group in forms]
+        if not heard or not said or sum(is_echo) / len(forms) < ECHO_WORD_OVERLAP:
             return f.text
-        keep = [not all(w in said for w in group) for group in forms]
+        keep = [not e for e in is_echo]
         # Unless we said the wake phrase ourselves, a wake phrase in the mix is the user's.
         m = self.wake.find(f.text)
         if m and not self.wake.find(" ".join(said)):
@@ -199,6 +210,11 @@ class Voice:
     def _overlaps(self, f: Final, spans: list[tuple[float, float]]) -> bool:
         return any(s < f.end + 0.3 and e > f.start - 0.3 for s, e in spans)
 
+    def _during_playback(self, f: Final) -> bool:
+        """English text heard while we spoke can't be checked against our Russian words:
+        the English stream turns our own voice into "two thousand and twenty six"."""
+        return self._overlaps(f, [(s, e) for s, e, _ in self.spoken])
+
     async def on_main_final(self, f: Final) -> None:
         if self.state in CONVERSATION_STATES and self.asr_alt is not None and not self.wake.find(f.text):
             # The language-detecting stream finishes the same utterance about now.
@@ -206,7 +222,7 @@ class Voice:
             while time.monotonic() < deadline and not self._alt_for(f):
                 await asyncio.sleep(0.03)
             alt = self._alt_for(f)
-            if alt and detect(alt.text) == "en" and not self.wake.find(alt.text):
+            if alt and detect(alt.text) == "en" and not self.wake.find(alt.text) and not self._during_playback(alt):
                 log.info("English %r (the Russian stream heard %r)", alt.text, f.text)
                 f = alt
         if self._overlaps(f, self.handled):
@@ -221,7 +237,8 @@ class Voice:
     async def on_alt_final(self, f: Final) -> None:
         self.alt_finals = [g for g in self.alt_finals if g.end > time.monotonic() - 30] + [f]
         # The wake phrase is the Russian stream's job (this one garbles it into "E dalba jok").
-        if self.state not in CONVERSATION_STATES or detect(f.text) != "en" or self.wake.find(f.text):
+        if self.state not in CONVERSATION_STATES or detect(f.text) != "en" or self.wake.find(f.text) \
+                or self._during_playback(f):
             return
         if self.asr.partial or self.asr.finishing:
             return  # the Russian stream is still on this utterance and will pick the English text
@@ -267,6 +284,11 @@ class Voice:
         if self.is_stop(text) and self.state != "idle":
             await self.interrupt("stop word")
             self.set_state("idle", "stop word")
+            return
+        if echo and len(words(text)) <= ECHO_RESIDUE_WORDS:
+            # Mostly our own voice; one or two leftovers are misheard echo ("кокаин" for
+            # "KuCoin"), not a command. Stop words and the wake phrase were handled above.
+            log.info("ignored echo leftovers %r", text)
             return
         if self.state in CONVERSATION_STATES and (not echo or self.state != "listening"):
             if self.state != "listening":

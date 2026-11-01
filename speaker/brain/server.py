@@ -19,8 +19,10 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import re
 import time
 import uuid
+from dataclasses import dataclass, field
 
 from aiohttp import WSMsgType, web
 
@@ -31,9 +33,54 @@ from .escalate import Harness, RemoteLLM
 from .llm import LLM
 from .memory import Memory
 from .timers import Item, Scheduler
-from .tools import BIG_MODEL_SCHEMA, SCHEMAS, Tools
+from .tools import BIG_MODEL_SCHEMA, SCHEMAS, WEB_SEARCH_SCHEMA, Tools
+from .websearch import WebSearch
 
 log = logging.getLogger("brain")
+
+CONFIRM_SECONDS = 30  # how long a "should I ...?" question waits for its yes/no
+_YES = {"да", "ага", "угу", "давай", "конечно", "спроси", "спрашивай", "можно", "хорошо", "ладно", "пусть",
+        "yes", "yeah", "yep", "sure", "ok", "okay", "please", "go"}
+_NO = {"нет", "не", "неа", "no", "nope", "don't", "dont"}
+
+
+def yes_no(text: str) -> bool | None:
+    """True/False for a short yes or no ("да", "не надо", "ладно, не надо"); None for anything else."""
+    words = re.findall(r"[\w']+", text.casefold().replace("ё", "е"))
+    if not words or len(words) > 5:
+        return None
+    if any(w in _NO for w in words):
+        return False
+    if any(w in _YES for w in words):
+        return True
+    return None
+
+
+class NeedsConfirmation(Exception):
+    """Raised from a tool call that must wait for the user's yes/no."""
+
+    def __init__(self, kind: str, args: dict):
+        super().__init__(kind)
+        self.kind = kind  # "big" or "search"
+        self.kind_tool = "ask_big_model" if kind == "big" else "web_search"
+        self.tool_args = args  # not `args`: Exception turns that into a tuple
+
+
+@dataclass
+class Pending:
+    kind: str
+    messages: list[dict]  # the conversation up to and including the paused tool call
+    call_id: str
+    args: dict
+    text: str  # the user's original request
+    lang: str
+    search: asyncio.Task | None = None  # web search already running while the user answers
+    expires: float = field(default_factory=lambda: time.monotonic() + CONFIRM_SECONDS)
+
+    def cancel(self) -> None:
+        if self.search:
+            self.search.cancel()
+
 
 RULES = """
 You are the voice of a home smart speaker, like Yandex Station's Alice. Everything you write is spoken aloud.
@@ -44,10 +91,19 @@ You are the voice of a home smart speaker, like Yandex Station's Alice. Everythi
 - Use the tools for timers, alarms, volume, weather, arithmetic and facts. Never say you did something without calling its tool.
 - For questions about real people, places, books, history or science, call lookup instead of guessing.
 - Save durable personal facts with save_memory. Questions about the user, their pets, family, things or preferences are answered from saved facts or search_memory, never lookup.
-- When ask_big_model is available, use it automatically for requests beyond your reasoning or knowledge ability.
+- When ask_big_model is available, use it for requests beyond your reasoning or knowledge ability; the user is asked to confirm first.
+- For current events, news, prices, schedules or anything else Wikipedia wouldn't have, call web_search with an English objective and English queries, then answer from the results in the reply language.
 - Each user message starts with the current date, time and reply language in square brackets. Don't mention the date or time unless asked.
 - You can't play music or control other devices; say so briefly if asked.
 """
+
+# Said while a slow tool runs, unless the model already said something first.
+PREFACES = {
+    "web_search": {"ru": "Сейчас поищу.", "en": "Let me look that up."},
+    "lookup": {"ru": "Сейчас гляну.", "en": "Let me check."},
+    "get_weather": {"ru": "Смотрю погоду.", "en": "Checking the weather."},
+    "ask_big_model": {"ru": "Спрошу большую модель.", "en": "Asking the big model."},
+}
 
 _RU_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
@@ -63,16 +119,28 @@ class Brain:
         self.tools = Tools(self)
         self.llm = LLM(cfg["llm"])
         self.system = cfg["character"]["prompt"].strip() + "\n" + RULES
+        # The remote model gets no tool definitions: it must not try to call any.
+        self.remote_system = self.system + "- In this conversation you have no tools: answer directly from what you know " \
+                                           "and from any information given in the message.\n"
         r, h = cfg["remote_llm"], cfg["harness"]
         self.memory = Memory(cfg["memory"], cfg.file(cfg["memory"]["state_file"]))
         self.remote = RemoteLLM(r) if r["enabled"] else None
         self.harness = Harness(h, str(cfg.file(h["cwd"]))) if h["enabled"] else None
         self.big_triggers = r["triggers"]
         self.harness_triggers = h["triggers"]
-        self.schemas = SCHEMAS + ([BIG_MODEL_SCHEMA] if self.remote and self.remote.configured else [])
+        self.web = WebSearch(cfg["web_search"])
+        self.confirm_big = bool(r["confirm"])
+        self.offer_big_for_search = bool(cfg["web_search"]["offer_big_model"])
+        self.schemas = SCHEMAS + ([WEB_SEARCH_SCHEMA] if self.web.enabled else []) \
+            + ([BIG_MODEL_SCHEMA] if self._big_ready else [])
+        self.pending: Pending | None = None  # a question the speaker asked and awaits yes/no for
         self.clients: set[web.WebSocketResponse] = set()
         self.turn: asyncio.Task | None = None
         self._load()
+
+    @property
+    def _big_ready(self) -> bool:
+        return bool(self.remote and self.remote.configured)
 
     # State -------------------------------------------------------------
     def _load(self) -> None:
@@ -129,7 +197,16 @@ class Brain:
         return None
 
     async def answer(self, text: str, lang: str, big: bool = False, harness: bool = False):
-        """Yield the spoken answer to one standalone utterance, sentence by sentence."""
+        """Yield the spoken answer to one utterance, sentence by sentence."""
+        pending, self.pending = self.pending, None
+        if pending:
+            choice = yes_no(text) if not (big or harness) and time.monotonic() < pending.expires else None
+            if choice is not None:
+                log.info("confirmation %s: %s", pending.kind, "yes" if choice else "no")
+                async for sentence in self._resolve(pending, choice):
+                    yield sentence
+                return
+            pending.cancel()  # the user moved on to something else
         if big and harness:
             raise ValueError("big and harness are mutually exclusive")
         mode = "big" if big else "harness" if harness else ""
@@ -152,7 +229,7 @@ class Brain:
                 if not self.remote or not self.remote.configured:
                     yield "Большая модель не настроена." if lang == "ru" else "The big model is not configured."
                 else:
-                    messages = [{"role": "system", "content": self.system},
+                    messages = [{"role": "system", "content": self.remote_system},
                                 {"role": "user", "content": f"{self._stamp(lang)} {prompt}"}]
                     async for sentence in self.remote.respond(messages):
                         yield sentence
@@ -178,11 +255,68 @@ class Brain:
         context = f" [Saved facts about the user: {' '.join(recalled)}]" if recalled else ""
         messages = [{"role": "system", "content": self.system},
                     {"role": "user", "content": f"{self._stamp(lang)}{context} {text}"}]
+        async for sentence in self._llm(messages, text, lang, self.schemas, confirm=True):
+            yield sentence
+
+    async def _llm(self, messages: list[dict], text: str, lang: str, schemas: list[dict], confirm: bool):
+        """Run LFM3 with tools. With `confirm`, the big model (and web search when the big
+        model could answer it) first asks the user; the turn ends on that question."""
+        def needs_confirm(name: str) -> bool:
+            return confirm and (name == "ask_big_model" and self.confirm_big
+                                or name == "web_search" and self.offer_big_for_search and self._big_ready)
 
         async def run_tool(name: str, args: dict):
+            if needs_confirm(name):
+                raise NeedsConfirmation("big" if name == "ask_big_model" else "search", args)
             return await self.tools.call(name, args, lang)
 
-        async for sentence in self.llm.respond(messages, self.schemas, run_tool, lang):
+        def preface(name: str) -> str | None:
+            # A tool that first asks the user says its own question instead.
+            return None if needs_confirm(name) else PREFACES.get(name, {}).get(lang)
+
+        try:
+            async for sentence in self.llm.respond(messages, schemas, run_tool, lang, preface=preface):
+                yield sentence
+        except NeedsConfirmation as c:
+            log.info("paused %s(%s) for the user's confirmation", c.kind_tool, c.tool_args)
+            assistant = next(m for m in reversed(messages) if m.get("tool_calls"))
+            call = next(tc for tc in assistant["tool_calls"] if tc["function"]["name"] == c.kind_tool)
+            search = None
+            if c.kind == "search":  # search while the user answers: both answers need the results
+                search = asyncio.create_task(self.tools.call("web_search", c.tool_args, lang))
+            self.pending = Pending(c.kind, messages, call["id"], c.tool_args, text, lang, search)
+            ru = lang == "ru"
+            if c.kind == "big":
+                yield "Это сложновато. Спросить большую модель?" if ru else "That's a tough one. Should I ask the big model?"
+            else:
+                yield "Ищу в интернете. Пусть ответит большая модель?" if ru else \
+                    "I'm searching the web. Should the big model answer?"
+
+    async def _resolve(self, p: "Pending", yes: bool):
+        ru = p.lang == "ru"
+        if p.kind == "big" and yes:
+            messages = [{"role": "system", "content": self.remote_system},
+                        {"role": "user", "content": f"{self._stamp(p.lang)} {p.args.get('question') or p.text}"}]
+            async for sentence in self.remote.respond(messages):
+                yield sentence
+            return
+        if p.kind == "search":
+            if not p.search.done():
+                yield "Ищу." if ru else "Searching."
+            result = await p.search
+            if yes:
+                found = json.dumps(result, ensure_ascii=False)
+                messages = [{"role": "system", "content": self.remote_system},
+                            {"role": "user", "content": f"{self._stamp(p.lang)} {p.text}\n\nWeb search results "
+                                                        f"(English; answer in the reply language):\n{found}"}]
+                async for sentence in self.remote.respond(messages):
+                    yield sentence
+                return
+        else:  # big model declined: LFM3 answers on its own
+            result = {"declined": "Answer this yourself as well as you can; don't mention the big model."}
+        p.messages.append({"role": "tool", "tool_call_id": p.call_id, "content": json.dumps(result, ensure_ascii=False)})
+        local = [s for s in self.schemas if s is not BIG_MODEL_SCHEMA]
+        async for sentence in self._llm(p.messages, p.text, p.lang, local, confirm=False):
             yield sentence
 
     async def _run_turn(self, turn_id: str, text: str, lang: str,

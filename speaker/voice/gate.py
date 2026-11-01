@@ -37,7 +37,10 @@ class Gate:
         self.audio: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue(maxsize=600)
         self.recent: deque[tuple[float, bytes]] = deque(maxlen=max(1, int(float(g["preroll_seconds"]) * 10)))
         self.active = False  # large ASR is active; the small gate can rest
-        self.wake = WakeMatcher(cfg["wake"]["phrases"], float(cfg["wake"]["threshold"]))
+        # The grammar holds the spellings this small model hears for the wake phrases
+        # ("наташка" for "гптшка"); any of them opens the gate, and Nemotron then
+        # checks the real wake phrase.
+        self.wake = WakeMatcher([p for p in g["grammar"] if p != "[unk]"], float(cfg["wake"]["threshold"]))
         SetLogLevel(-1)
         torch.set_num_threads(1)
         self.vad = torch.jit.load(str(cfg.file(g["vad_model"])))

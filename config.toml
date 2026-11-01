@@ -12,19 +12,19 @@ prompt = """
 ругнуться, но без злобы. Своё имя и прозвище вслух не произноси.
 """
 # What the speaker says when it hears only the wake phrase.
-ack = { ru = "Чё надо?", en = "What do you want?" }
+ack = { ru = "Чё такое?", en = "What do you want?" }
 
 [wake]
 # Spoken phrases that wake the speaker. Matching tolerates ASR spelling
 # slips ("долбоеб", "пей долбаёб"); `threshold` is the minimum similarity 0..1.
-phrases = ["эй долбаёб", "долбаёб"]
+phrases = ["Эй гптшка", "Эй колонка", "гптшка", "колонка"]
 threshold = 0.78
 # Recognition bias toward the phrases above. Higher catches more mumbled
 # wakes but starts hearing the phrase in other speech (5 already does).
 boost = 2.0
 # Words that stop speech, a ringing timer or the current answer without the
 # wake phrase, as long as the utterance is only that word.
-stop_words = ["стоп", "хватит", "замолчи", "заткнись", "тихо", "отмена", "stop", "enough", "cancel", "shut up"]
+stop_words = ["стоп", "хватит", "замолчи", "заткнись", "ебало закрой", "тихо", "отмена", "stop", "enough", "cancel", "shut up"]
 
 [gate]
 # Silero VAD skips silence, then Vosk small Russian listens for the wake
@@ -38,8 +38,10 @@ vad_threshold = 0.5
 # measured ≤0.0006 when quiet and 0.005-0.04 for speech chunks. 0 = always run VAD.
 energy_floor = 0.0015
 preroll_seconds = 2.0
-# Vosk's dictionary lacks "долбаёб" but knows these recognized spellings.
-grammar = ["эй долбоёб", "и долбоёб", "долбоёб", "[unk]"]
+# What the small Vosk model hears for each wake phrase; any of these opens the
+# gate and Nemotron then checks the real phrase. Must use words Vosk knows (it
+# lacks "гптшка" and hears it as "наташка"); update this with [wake] phrases.
+grammar = ["эй колонка", "и колонка", "колонка", "эй наташка", "и наташка", "наташка", "[unk]"]
 
 [audio]
 # Substring of the PortAudio device name ("default" for the system default).
@@ -114,6 +116,27 @@ max_tokens = 4096
 temperature = 0.3
 timeout = 180
 triggers = ["спроси большую модель", "ask the big model", "use the big model"]
+# When LFM3 decides on its own to ask the big model, ask the user first
+# ("Спросить большую модель?"). Explicit triggers above never ask.
+confirm = true
+
+[web_search]
+# Parallel web search. LFM3 writes the queries in English and answers in the
+# user's language. With $PARALLEL_API_KEY set, the API runs in `mode`
+# ("turbo" ~0.2 s, English only; "fast" ~0.7 s); without a key, the free
+# hosted endpoint is used (fast mode, lower rate limits).
+enabled = true
+api_key_env = "PARALLEL_API_KEY"
+mode = "turbo"
+results = 5
+# Characters kept per result, to keep the prompt short.
+excerpt_chars = 600
+# Paid searches can't be capped on Parallel's side; this caps them here.
+max_per_day = 200
+timeout = 15
+# When the big model is configured, ask whether it should answer from the
+# search results ("Пусть ответит большая модель?") instead of LFM3.
+offer_big_model = true
 
 [harness]
 # A real argv command, not a shell string. Every %p is replaced with the user

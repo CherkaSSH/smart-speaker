@@ -22,11 +22,13 @@ from tomlkit.items import Comment, InlineTable, String, StringType, Whitespace
 USERS = {
     "character": ("brain", "voice"), "wake": ("voice",), "gate": ("voice",), "audio": ("voice", "brain"),
     "asr": ("asr", "voice"), "tts": ("voice",), "llm": ("llm", "brain"), "remote_llm": ("brain",),
-    "harness": ("brain",), "memory": ("embed", "brain"), "brain": ("brain",), "voice": ("voice",),
+    "harness": ("brain",), "web_search": ("brain",), "memory": ("embed", "brain"), "brain": ("brain",),
+    "voice": ("voice",),
 }
 CHOICES = {
     ("asr", "device"): ["vulkan", "cpu"],
     ("tts", "ru_speaker"): ["aidar", "baya", "kseniya", "xenia", "eugene"],
+    ("web_search", "mode"): ["turbo", "fast", "basic", "advanced"],
 }
 RANGES = {
     ("wake", "threshold"): (0, 1), ("gate", "vad_threshold"): (0, 1), ("audio", "volume"): (0, 10),
