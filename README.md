@@ -96,6 +96,14 @@ speaker ask "запусти агента: проверь этот проект"
 
 Use another configuration with `speaker --config /path/to/config.toml up` or `$SPEAKER_CONFIG`.
 
+## Settings
+
+```sh
+speaker settings
+```
+
+Opens `config.toml` in a terminal editor: sections on the left, fields on the right, with each comment from the file shown above the keys it describes. Switches edit booleans, numbers are checked as you type (thresholds, volume and temperatures also against their ranges), lists take one item per line, and the ASR device and Russian voice are drop-downs. **Ctrl+S** saves, keeping the file's comments and layout, and lists the processes to restart; **Ctrl+R** reverts unsaved edits; **Ctrl+Q** quits (twice if there are unsaved changes).
+
 ## Voice behavior
 
 - Say **«Эй, долбаёб, поставь таймер на пять минут»**, or say the wake phrase alone and wait for the acknowledgement.
@@ -105,4 +113,4 @@ Use another configuration with `speaker --config /path/to/config.toml up` or `$S
 - Volume commands use levels 0–10. Timers and alarms persist in `state/brain.json`; personal memories persist in `state/memory.sqlite3`.
 - Music playback and smart-home control are not implemented.
 
-Tune wake matching, stop words, microphone gain, output channels, TTS voices, endpoint silence, the 4096-token generation ceiling, escalation backends and the character prompt in `config.toml`.
+Tune wake matching, stop words, microphone gain, output channels, TTS voices, endpoint silence, the 4096-token generation ceiling, escalation backends and the character prompt in `config.toml`, by hand or with `speaker settings`.

@@ -11,6 +11,8 @@ dependencies = [
     "soxr>=0.5",
     "torch==2.8.0",
     "vosk>=0.3.45",
+    "textual>=8.2.8",
+    "tomlkit>=0.15.2",
 ]
 
 [project.scripts]

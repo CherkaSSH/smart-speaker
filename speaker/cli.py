@@ -105,6 +105,7 @@ def main() -> None:
     sub.add_parser("asr", help="run the Nemotron ASR server")
     sub.add_parser("brain", help="run the thinking service")
     sub.add_parser("voice", help="run the audio service")
+    sub.add_parser("settings", help="edit config.toml in a terminal UI")
     ask = sub.add_parser("ask", help="ask the running brain in text")
     ask.add_argument("text")
     mode = ask.add_mutually_exclusive_group()
@@ -128,6 +129,9 @@ def main() -> None:
     elif args.cmd == "voice":
         from .voice.service import run
         asyncio.run(run(cfg))
+    elif args.cmd == "settings":
+        from .settings import run as edit_settings
+        edit_settings(cfg.path)
     elif args.cmd == "up":
         asyncio.run(up(cfg, args))
     elif args.cmd == "ask":
