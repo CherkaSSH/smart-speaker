@@ -75,8 +75,10 @@ echo_music_model = "models/localvqe-pi-aec-v1-49k-f32.gguf"
 # from your voice when echo_cancellation is off). Without a .json, the file's
 # own tags are used.
 library = "music"
-# Where music comes from, in search order. "local" = the library, "radio" =
-# the stations below. Streaming services plug in as more providers (README).
+# Where music comes from. A request plays from the first provider here that
+# finds something: "local" = the library, "navidrome" and "yandex" = the
+# streaming services below. "radio" (the stations below) answers only radio
+# requests. With "yandex" first, «включи музыку» plays My Wave.
 providers = ["local", "radio"]
 # Music volume while you talk or the speaker answers (fraction of normal).
 duck_volume = 0.2
@@ -84,6 +86,12 @@ duck_volume = 0.2
 # the music alone would make it (2.0 = 6 dB).
 talk_factor = 2.0
 radio = { "Groove Salad" = "https://ice1.somafm.com/groovesalad-128-mp3", "Secret Agent" = "https://ice1.somafm.com/secretagent-128-mp3" }
+# A Navidrome (or other Subsonic) server; the password is read from the
+# environment variable named here.
+navidrome = { url = "http://127.0.0.1:4533", user = "speaker", password_env = "NAVIDROME_PASSWORD" }
+# Yandex Music: get a token with `speaker yandex-login` and export it under this
+# name. Full tracks need Yandex Plus; without a token only 30 s previews play.
+yandex = { token_env = "YANDEX_MUSIC_TOKEN" }
 
 [asr]
 url = "ws://127.0.0.1:8090/v1/audio/transcriptions/realtime"

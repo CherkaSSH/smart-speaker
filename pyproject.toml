@@ -13,6 +13,7 @@ dependencies = [
     "vosk>=0.3.45",
     "textual>=8.2.8",
     "tomlkit>=0.15.2",
+    "yandex-music>=2.2",
 ]
 
 [project.scripts]

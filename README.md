@@ -73,9 +73,9 @@ While a slow tool runs (web search, Wikipedia, weather, big model) the speaker s
 
 ### Music
 
-Say «включи музыку» (shuffle the library), «включи май бонни» (a song or artist; Cyrillic spellings of Latin titles work), «включи радио» or «включи радио секрет эйджент» (internet radio from `[music] radio`), then «пауза», «продолжи», «следующая», «предыдущая», «что играет?», «выключи музыку». Each needs the wake phrase, as on Yandex Station. Pause, resume and skip act silently. Anything vaguer goes to LFM3 through the `play_music` and `music_control` tools; when nothing matches, it gets the library's titles and can retry.
+Say «включи музыку» (shuffle the library), «включи май бонни» (a song or artist; Cyrillic spellings of Latin titles work), «включи радио» or «включи радио секрет эйджент» (internet radio from `[music] radio`), then «пауза», «продолжи», «следующая», «предыдущая», «что играет?», «выключи музыку». Each needs the wake phrase, as on Yandex Station. Pause, resume and skip act silently. Anything vaguer goes to LFM3 through the `play_music` and `music_control` tools; when nothing matches, it gets the library's titles and can retry. After the songs that match, music continues with the rest of the same source, and when the queue runs out it refills (a new shuffle, the next My Wave batch), as on the Station.
 
-The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title` and `artist`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. With `echo_cancellation = false`, lyrics are added to echo removal while the song plays, so sung words are not taken for your voice. With it on, the canceller removes the singer, and lyric words in a transcript are yours («включи хас булат удалой» over Хас-Булат).
+The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title`, `artist` and `album`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. With `echo_cancellation = false`, lyrics are added to echo removal while the song plays, so sung words are not taken for your voice. With it on, the canceller removes the singer, and lyric words in a transcript are yours («включи хас булат удалой» over Хас-Булат).
 
 `music/` is not in git. The test library is four public-domain recordings with vocals from Wikimedia Commons, each with lyrics and metadata sidecars:
 
@@ -90,18 +90,15 @@ Each `.json` sidecar records the source and lyrics URLs. The Russian lyrics are 
 
 Music turns down to `duck_volume` while the speaker listens, thinks or answers, and when you start talking over it: the wake gate learns how loud the music normally sounds in the mic and ducks it when the mic gets `talk_factor` times louder than that while it hears speech. That lowers the music before the wake phrase is even recognized.
 
-#### Adding a streaming service
+#### Streaming: Navidrome and Yandex Music
 
-Playback takes anything ffmpeg can open, including HTTP and HLS stream URLs, so a streaming service is only a provider in `speaker/brain/music.py` with two methods:
+`[music] providers` lists where music comes from; a request plays from the first one that finds something. `"radio"` only answers radio requests. Playback takes anything ffmpeg can open, so streams need no voice-service changes; each provider resolves a fresh stream URL right before a track plays (`speaker/brain/music.py`).
 
-```python
-class YandexMusic:
-    name = "yandex"
-    async def search(self, query: str, limit: int) -> list[Track]: ...  # the service's search API
-    async def resolve(self, track: Track) -> str: ...                    # a fresh stream URL for this track
-```
+**Navidrome** (or any Subsonic server): set `url` and `user` in `[music] navidrome` and export the password under the name in `password_env` (default `NAVIDROME_PASSWORD`). Requests use Subsonic token auth, so the password itself is not sent. Navidrome's search is word-based and wouldn't find "My Bonnie" from «май бонни», so the provider fetches the whole song list (500 songs per request, refreshed every 10 minutes) and matches it like the local library: title, artist and album.
 
-Register it next to `LocalLibrary` and `Radio` in `Music.__init__` and add its name to `[music] providers`; credentials belong in an environment variable, like the other API keys. `resolve()` runs right before each track plays, so expiring stream URLs stay valid, and the voice service needs no changes. Spotify is the exception: it doesn't hand out stream URLs, so it would need a Spotify Connect receiver such as librespot instead.
+**Yandex Music** (through the [`yandex-music`](https://github.com/MarshalX/yandex-music-api) library): run `speaker yandex-login`, open the printed page, enter the code, and export the printed `YANDEX_MUSIC_TOKEN=...`. Full tracks need an account with Yandex Plus; without a token the API serves 30-second previews and there is no My Wave. Yandex's own search handles misheard names, and its best result decides what plays: a song, an artist's popular songs («включи земфиру»), an album or a playlist. With `"yandex"` first in `providers`, «включи музыку» plays My Wave. On this machine about 1 in 4 new TLS connections to the API stalled for 5 s and was reset, so the provider keeps connections alive and retries a failed request once. Starting a track then takes 0.6–0.9 s (search, download info, signed link); the first one also signs in (3.7 s).
+
+Spotify doesn't hand out stream URLs, so it would need a Spotify Connect receiver such as librespot instead of a provider.
 
 ### Echo cancellation
 

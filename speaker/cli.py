@@ -1,4 +1,4 @@
-"""speaker up | llm | asr | brain | voice | ask TEXT"""
+"""speaker up | llm | asr | brain | voice | ask TEXT | settings | yandex-login"""
 
 from __future__ import annotations
 
@@ -106,6 +106,7 @@ def main() -> None:
     sub.add_parser("brain", help="run the thinking service")
     sub.add_parser("voice", help="run the audio service")
     sub.add_parser("settings", help="edit config.toml in a terminal UI")
+    sub.add_parser("yandex-login", help="sign in to Yandex Music and print the token to export")
     ask = sub.add_parser("ask", help="ask the running brain in text")
     ask.add_argument("text")
     mode = ask.add_mutually_exclusive_group()
@@ -132,6 +133,9 @@ def main() -> None:
     elif args.cmd == "settings":
         from .settings import run as edit_settings
         edit_settings(cfg.path)
+    elif args.cmd == "yandex-login":
+        from .brain.music import yandex_login
+        asyncio.run(yandex_login(cfg["music"]["yandex"]["token_env"]))
     elif args.cmd == "up":
         asyncio.run(up(cfg, args))
     elif args.cmd == "ask":
