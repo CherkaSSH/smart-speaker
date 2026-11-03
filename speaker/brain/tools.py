@@ -294,7 +294,7 @@ class Tools:
     async def t_play_music(self, query: str = "", radio: bool = False) -> dict:
         if not self.brain.clients:
             return {"error": "the voice service is not connected"}
-        track = await self.brain.music.play(query, bool(radio))
+        track = await self.brain.music.play(query, bool(radio), self.lang)
         if track is None:
             local = next((p for p in self.brain.music.providers if p.name == "local"), None)
             known = local.titles()[:30] if local else []

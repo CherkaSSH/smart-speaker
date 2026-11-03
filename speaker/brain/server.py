@@ -8,6 +8,8 @@ Protocol (JSON text frames):
                   {"type": "say", "id": str, "text": str, "lang": str}
                   {"type": "turn_end", "id": str, "expect_reply": bool}
                   {"type": "ring", "text": str, "lang": str}   a timer or alarm went off
+                  {"type": "ask", "text": str, "lang": str}    a question of the speaker's own («Включить
+                                                               мою волну?»); the reply comes as an utterance
 
 HTTP: POST /ask {"text", "lang"?, "speak"?, "big"?, "harness"?} answers in JSON,
 for testing without audio; "speak": true also sends it to the voice service.
@@ -32,7 +34,7 @@ from . import intents, speech
 from .escalate import Harness, RemoteLLM
 from .llm import LLM
 from .memory import Memory
-from .music import Music, asks_for_music
+from .music import MY_WAVE, Music, asks_for_music
 from .timers import Item, Scheduler
 from .tools import BIG_MODEL_SCHEMA, SCHEMAS, WEB_SEARCH_SCHEMA, Tools
 from .websearch import WebSearch
@@ -69,7 +71,7 @@ class NeedsConfirmation(Exception):
 
 @dataclass
 class Pending:
-    kind: str
+    kind: str  # "big", "search" or "music"
     messages: list[dict]  # the conversation up to and including the paused tool call
     call_id: str
     args: dict
@@ -182,6 +184,15 @@ class Brain:
                 f"Your {speech.duration(item.seconds, 'en')} timer is done."
         log.info("ring: %s", text)
         await self.broadcast({"type": "ring", "text": text, "lang": item.lang})
+
+    async def offer(self, kind: str, question: str, lang: str) -> None:
+        """Ask on the speaker's own initiative (the songs the user asked for ended); the next
+        utterance's yes or no resolves it, like the speaker's other questions."""
+        if self.pending:
+            self.pending.cancel()
+        self.pending = Pending(kind, [], "", {}, question, lang)
+        log.info("asking: %s", question)
+        await self.broadcast({"type": "ask", "text": question, "lang": lang})
 
     # Turns -------------------------------------------------------------
     def _stamp(self, lang: str) -> str:
@@ -300,6 +311,17 @@ class Brain:
 
     async def _resolve(self, p: "Pending", yes: bool):
         ru = p.lang == "ru"
+        if p.kind == "music":
+            track = await self.music.keep_playing() if yes else None
+            if not yes:
+                yield "Ладно." if ru else "Okay."
+            elif track is None:
+                yield "Не получилось включить." if ru else "I couldn't play anything."
+            elif track.station == MY_WAVE:
+                yield "Включаю мою волну." if ru else "Playing My Wave."
+            else:
+                yield "Включаю музыку." if ru else "Playing some music."
+            return
         if p.kind == "big" and yes:
             messages = [{"role": "system", "content": self.remote_system},
                         {"role": "user", "content": f"{self._stamp(p.lang)} {p.args.get('question') or p.text}"}]

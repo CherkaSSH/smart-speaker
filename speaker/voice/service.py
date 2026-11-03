@@ -361,6 +361,13 @@ class Voice:
         elif kind == "ring":
             await self.interrupt("ring")
             self.ring_task = asyncio.create_task(self.ring(msg["text"]))
+        elif kind == "ask":  # a question of the brain's own («Включить мою волну?»): say it, then listen
+            if self.state != "idle":
+                log.info("not asking %r: %s", msg["text"], self.state)  # the user is busy with something else
+                return
+            self.turn_id = uuid.uuid4().hex[:8]
+            await self.speech.put((self.turn_id, msg["text"], False))
+            await self.speech.put((self.turn_id, None, True))
 
     async def on_music_command(self, msg: dict) -> None:
         action = msg["action"]

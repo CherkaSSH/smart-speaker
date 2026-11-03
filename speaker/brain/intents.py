@@ -217,12 +217,13 @@ async def _music(brain: "Brain", t: str, words: list[str], ru: bool) -> str | No
             return None  # "включи свет": the LLM explains it can't control devices
         if not brain.clients:
             return "Голосовой модуль не подключён." if ru else "The voice service is not connected."
+        lang = "ru" if ru else "en"
         if radio:
-            track = await music.play(station, True)
+            track = await music.play(station, True, lang)
         elif query and _has(m.group(2), r"\b(музык\w*|music)\b"):  # «спокойную музыку»: a wave, else a search
-            track = await music.play(query, True) or await music.play(query)
+            track = await music.play(query, True, lang) or await music.play(query, False, lang)
         else:
-            track = await music.play(query)
+            track = await music.play(query, False, lang)
         if track is None:
             if m.group(1) in ("поставь", "put on"):
                 return None  # "поставь напоминание ...": not necessarily music

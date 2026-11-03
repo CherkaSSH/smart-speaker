@@ -30,6 +30,7 @@ CHOICES = {
     ("asr", "device"): ["vulkan", "cpu"],
     ("tts", "ru_speaker"): ["aidar", "baya", "kseniya", "xenia", "eugene"],
     ("web_search", "mode"): ["turbo", "fast", "basic", "advanced"],
+    ("music", "after_request"): ["ask", "continue", "stop"],
 }
 RANGES = {
     ("wake", "threshold"): (0, 1), ("gate", "vad_threshold"): (0, 1), ("audio", "volume"): (0, 10),

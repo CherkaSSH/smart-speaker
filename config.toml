@@ -81,6 +81,10 @@ library = "music"
 # decade: «включи радио рок») and "radio", the internet stations below. With
 # "yandex" first, «включи музыку» and «включи радио» play My Wave.
 providers = ["local", "radio"]
+# When the songs you asked for by name end: "ask" («Включить мою волну?»;
+# «да» starts it), "continue" (start it without asking) or "stop". It is My
+# Wave when Yandex Music has a token, otherwise more from the same source.
+after_request = "ask"
 # Music volume while you talk or the speaker answers (fraction of normal).
 duck_volume = 0.2
 # You are talking over the music when the mic is this many times louder than

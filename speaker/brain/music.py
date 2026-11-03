@@ -322,6 +322,11 @@ class YandexMusic:
         self._wave_last: dict[str, str] = {}  # rotor id -> last track handed out: the next batch follows it
         self._batches: dict[str, tuple[str, str]] = {}  # track id -> (rotor id, batch id), for feedback
 
+    @property
+    def has_waves(self) -> bool:
+        """Waves (My Wave too) need a signed-in account."""
+        return bool(os.environ.get(self.token_env))
+
     async def _api(self):
         if self._client is None:
             token = os.environ.get(self.token_env)
@@ -483,6 +488,11 @@ class Music:
         self.queue: list[Track] = []
         self.index = 0
         self.state = "stopped"  # mirrors the voice service: stopped, playing, paused
+        self.after_request = cfg["after_request"]
+        if self.after_request not in ("ask", "continue", "stop"):
+            raise ValueError(f"[music] after_request must be ask, continue or stop, not {self.after_request!r}")
+        self.requested = False  # the queue is songs the user named: when they run out, after_request decides
+        self.lang = "ru"  # of the request that started the queue, for «Включить мою волну?»
         self._playing: tuple[Track, float] | None = None  # the started track and when, for feedback
         self._feedback_tasks: set[asyncio.Task] = set()
 
@@ -519,13 +529,36 @@ class Music:
         seen = {t.id for t in after}
         return [t for t in more if t.id not in seen]
 
-    async def play(self, query: str = "", radio: bool = False) -> Track | None:
+    def _my_wave(self) -> Provider | None:
+        return next((p for p in self.providers if getattr(p, "has_waves", False)), None)
+
+    async def _continuation(self, after: Track) -> list[Track]:
+        """What follows the songs the user asked for: My Wave if Yandex Music can play it, else more of
+        the same source."""
+        wave = self._my_wave()
+        if wave is not None:
+            try:
+                tracks = await wave.search("", 20)
+            except Exception:
+                log.exception("My Wave failed")
+                tracks = []
+            if tracks:
+                return tracks
+        return await self._more([after])
+
+    async def play(self, query: str = "", radio: bool = False, lang: str = "ru") -> Track | None:
         tracks = await self.find(query, radio)
         if not tracks:
             return None
-        if query and not radio and not tracks[0].station:
-            tracks += await self._more(tracks)
-        return await self._replace_queue(tracks)
+        self.lang = lang
+        return await self._replace_queue(tracks, requested=bool(query) and not radio and not tracks[0].station)
+
+    async def keep_playing(self) -> Track | None:
+        """The user said yes to «Включить мою волну?» after the songs they asked for ended."""
+        if self.state != "stopped" or not self.queue:
+            return None
+        tracks = await self._continuation(self.queue[self.index])
+        return await self._replace_queue(tracks) if tracks else None
 
     async def similar(self) -> Track | None:
         """A wave of songs like the one playing (Yandex Music finds them; a local song is looked up there)."""
@@ -540,10 +573,18 @@ class Music:
             return None
         return await self._replace_queue(tracks) if tracks else None
 
-    async def _replace_queue(self, tracks: list[Track]) -> Track | None:
+    async def _replace_queue(self, tracks: list[Track], requested: bool = False) -> Track | None:
         self._report(None)
-        self.queue, self.index = tracks, 0
+        self.queue, self.index, self.requested = tracks, 0, requested
         return self.current if await self._send_current() else None
+
+    async def _offer_more(self) -> None:
+        ru = self.lang == "ru"
+        if self._my_wave() is not None:
+            question = "Включить мою волну?" if ru else "Shall I play My Wave?"
+        else:
+            question = "Включить ещё музыку?" if ru else "Shall I play more music?"
+        await self.brain.offer("music", question, self.lang)
 
     async def _send_current(self) -> bool:
         """Start queue[index], skipping tracks the service won't hand out (False: none left)."""
@@ -594,7 +635,9 @@ class Music:
             step = 1 if action == "next" else -1
             cur = self.queue[self.index]
             if step == 1 and self.index + 1 == len(self.queue) and not cur.live:
-                self.queue += await self._more([cur])  # skipping the last of a wave batch: the next batch
+                # Skipping the last song: past requested songs comes My Wave, past a wave batch the next one.
+                self.queue += await (self._continuation(cur) if self.requested else self._more([cur]))
+                self.requested = False
             if not 0 <= self.index + step < len(self.queue):
                 return False
             self._report("skipped")
@@ -619,7 +662,14 @@ class Music:
             log.warning("could not play %s: %s", cur.label("en"), detail)
         self._report("finished" if event == "ended" else None)
         if event == "ended" and not cur.live and self.index + 1 == len(self.queue):
-            self.queue += await self._more([cur])  # the queue ran out: more of the same service
+            if self.requested and self.after_request != "continue":
+                self.state, self.requested = "stopped", False
+                if self.after_request == "ask":
+                    await self._offer_more()
+                return
+            # The queue ran out: My Wave after requested songs, else more of the same wave or source.
+            self.queue += await (self._continuation(cur) if self.requested else self._more([cur]))
+            self.requested = False
         if event in ("ended", "error") and not cur.live and self.index + 1 < len(self.queue):
             self.index += 1
             await self._send_current()
