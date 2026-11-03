@@ -1,0 +1,6 @@
+[Unit]
+Description=Smart speaker (all five services)
+Wants=speaker-llm.service speaker-embed.service speaker-asr.service speaker-brain.service speaker-voice.service
+
+[Install]
+WantedBy=default.target

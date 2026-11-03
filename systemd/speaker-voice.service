@@ -1,0 +1,16 @@
+[Unit]
+Description=Smart speaker: voice (microphone, wake phrase, speech, playback)
+PartOf=speaker.target
+# The voice service keeps retrying the ASR server and the brain until they are up.
+Wants=speaker-asr.service speaker-brain.service
+After=speaker-asr.service speaker-brain.service
+
+[Service]
+WorkingDirectory=@DIR@
+EnvironmentFile=%E/speaker/env
+ExecStart=@DIR@/.venv/bin/speaker voice
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=speaker.target

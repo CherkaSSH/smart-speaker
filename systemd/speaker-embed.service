@@ -1,0 +1,13 @@
+[Unit]
+Description=Smart speaker: memory embeddings (llama-server)
+PartOf=speaker.target
+
+[Service]
+WorkingDirectory=@DIR@
+EnvironmentFile=%E/speaker/env
+ExecStart=@DIR@/.venv/bin/speaker embed
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=speaker.target

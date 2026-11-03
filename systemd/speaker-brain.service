@@ -1,0 +1,17 @@
+[Unit]
+Description=Smart speaker: brain (conversation, tools, timers, music)
+PartOf=speaker.target
+# Not hard dependencies: the brain answers fast commands without the LLM and
+# works without memory recall while those servers start.
+Wants=speaker-llm.service speaker-embed.service
+After=speaker-llm.service speaker-embed.service
+
+[Service]
+WorkingDirectory=@DIR@
+EnvironmentFile=%E/speaker/env
+ExecStart=@DIR@/.venv/bin/speaker brain
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=speaker.target

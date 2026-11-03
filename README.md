@@ -14,7 +14,7 @@ The default character is a sarcastic Russian speaker woken by **«Эй, коло
 
 ## Setup
 
-Requires Nix with flakes and an ALSA audio device.
+Needs an ALSA audio device (a mic and a speaker, or a headset) and Linux. The speaker was developed on NixOS with the flake below; without Nix, see [Setup without Nix](#setup-without-nix).
 
 ```sh
 nix develop
@@ -187,7 +187,56 @@ speaker ask "спроси большую модель: объясни квант
 speaker ask "запусти агента: проверь этот проект"
 ```
 
-Use another configuration with `speaker --config /path/to/config.toml up` or `$SPEAKER_CONFIG`.
+Use another configuration with `speaker --config /path/to/config.toml up` or `$SPEAKER_CONFIG`. A `config.local.toml` in the repo root is git-ignored, for your own settings.
+
+### As systemd services
+
+`systemd/` has a user unit per process and `speaker.target` for all five; each restarts on failure and logs to the journal. They work without Nix (the dev shell's variables come from an environment file instead):
+
+```sh
+systemd/install.sh                          # units into ~/.config/systemd/user, env into ~/.config/speaker/env
+$EDITOR ~/.config/speaker/env               # PATH to llama-server/nemo-speech/ffmpeg, LOCALVQE_LIB, ALSA_CONFIG_PATH, keys
+systemctl --user enable --now speaker.target
+sudo loginctl enable-linger $USER           # start at boot without logging in
+journalctl --user -u speaker-voice -f       # or speaker-brain, speaker-llm, ...
+```
+
+`systemd/install.sh uninstall` removes them. The voice service needs access to `/dev/snd`; with linger and no desktop session that usually means adding yourself to the `audio` group.
+
+## Setup without Nix
+
+These steps mirror the flake's builds (same versions and CMake flags); they have only been exercised through the flake on NixOS. Package names are Debian/Ubuntu's.
+
+```sh
+sudo apt install ffmpeg alsa-utils libportaudio2 libsndfile1-dev libasound2-dev git cmake ninja-build pkg-config \
+    glslc libvulkan-dev spirv-headers libssl-dev libsentencepiece-dev libabsl-dev libprotobuf-dev protobuf-compiler
+curl -LsSf https://astral.sh/uv/install.sh | sh     # uv fetches Python 3.12 itself
+
+# llama.cpp with Vulkan (LFM3 needs b11960 or newer)
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout b12017
+cmake -B build -G Ninja -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+cmake --build build && sudo cmake --install build && cd ..
+
+# nemo-speech (Nemotron ASR server)
+git clone --recursive https://github.com/NVIDIA/NeMo-Speech.cpp && cd NeMo-Speech.cpp
+git checkout 20999cc921d2b14aa58708f61756a8b2e787ba20 && git submodule update --init --recursive
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_LLAMAFILE=ON -DGGML_VULKAN=ON \
+    -DNEMO_SPEECH_GGML_PATCHED=ON -DNEMO_SPEECH_BUILD_ASR=ON -DNEMO_SPEECH_BUILD_DIAR=OFF -DNEMO_SPEECH_BUILD_TTS=OFF \
+    -DNEMO_SPEECH_BUILD_NMT=OFF -DNEMO_SPEECH_BUILD_SPEECHLM=ON -DNEMO_SPEECH_BUILD_HTTP=ON -DNEMO_SPEECH_BUILD_GRPC=OFF \
+    -DNEMO_SPEECH_BUILD_TESTS=OFF
+cmake --build build && sudo cmake --install build && cd ..
+
+# LocalVQE echo canceller (optional: or set [audio] echo_cancellation = false)
+git clone --recursive https://github.com/localai-org/LocalVQE && cd LocalVQE/ggml
+git checkout 7f61cd05095d42e56a135b303f5bb4d761da22b9 && git submodule update --init --recursive
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOCALVQE_BUILD_SHARED=ON && cmake --build build
+sudo cp -P build/bin/*.so* /usr/local/lib/ && sudo ldconfig && cd ../..
+
+uv sync
+```
+
+Then download the models (see [Setup](#setup)), point `alsa/speaker.conf` at your card, and either export what the dev shell sets (`LOCALVQE_LIB=/usr/local/lib/liblocalvqe.so`, `ALSA_CONFIG_PATH=/usr/share/alsa/alsa.conf:$PWD/alsa/speaker.conf`) before `speaker up`, or install the [systemd services](#as-systemd-services). Without a Vulkan GPU, set `[asr] device = "cpu"` and `[llm] gpu_layers = 0` (and `[memory] gpu_layers = 0`).
 
 ## Settings
 

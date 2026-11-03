@@ -1,0 +1,13 @@
+[Unit]
+Description=Smart speaker: LFM3 language model (llama-server)
+PartOf=speaker.target
+
+[Service]
+WorkingDirectory=@DIR@
+EnvironmentFile=%E/speaker/env
+ExecStart=@DIR@/.venv/bin/speaker llm
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=speaker.target
