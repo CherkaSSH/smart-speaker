@@ -42,6 +42,7 @@ log = logging.getLogger("brain.agents")
 START_TIMEOUT = 60  # seconds for a new thread to start and connect
 DONE_CHARS = 300  # how much of a final answer is read out when the agent didn't speak itself
 NAME_MATCH = 0.85  # how closely spoken words must match a session's name (music's fuzzy score)
+RECENT_SESSIONS = 15  # closed sessions a name is looked for among, most recently used first
 
 _ORDINAL_STEMS = {"перв": 1, "втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6, "седьм": 7, "восьм": 8, "девят": 9}
 _NUMBERS = {"один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
@@ -154,14 +155,22 @@ class Thread:
         return (_ICONS.sub("", self.name).strip() or Path(self.cwd).name or "omp")[:60]
 
 
-def saved_sessions(root: Path) -> list[Saved]:
-    """Every omp session on disk, newest first. A session file starts with its title record and header."""
-    out = []
+def saved_sessions(root: Path, limit: int) -> list[Saved]:
+    """The `limit` most recently used omp sessions on disk, newest first. A session file starts with
+    its title record and header."""
+    files = []
     for f in root.glob("*/*.jsonl"):
+        try:
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    out = []
+    for mtime, f in sorted(files, reverse=True):
+        if len(out) == limit:
+            break
         try:
             with f.open(encoding="utf-8") as fh:
                 head = [json.loads(line) for line, _ in zip(fh, range(3)) if line.strip()]
-            mtime = f.stat().st_mtime
         except (OSError, ValueError):
             continue
         header = next((r for r in head if r.get("type") == "session"), None)
@@ -169,7 +178,7 @@ def saved_sessions(root: Path) -> list[Saved]:
             continue
         title = next((r.get("title", "") for r in head if r.get("type") == "title"), header.get("title", ""))
         out.append(Saved(header.get("id", ""), str(f), header.get("cwd", ""), title or "", mtime))
-    return sorted(out, key=lambda s: s.mtime, reverse=True)
+    return out
 
 
 class Agents:
@@ -265,7 +274,8 @@ class Agents:
         words = rest.split()
         live = {t.session for t in self.threads}
         candidates: list[tuple[Thread | Saved, list[str]]] = [(t, _names(t.name, t.cwd)) for t in self.threads]
-        candidates += [(s, _names(s.name, s.cwd)) for s in saved_sessions(self.sessions) if s.session not in live]
+        candidates += [(s, _names(s.name, s.cwd)) for s in saved_sessions(self.sessions, RECENT_SESSIONS)
+                       if s.session not in live]
         best, best_score = None, NAME_MATCH
         for k in (2, 1):
             spoken = " ".join(words[:k]).strip(",.:;!?—- ")
