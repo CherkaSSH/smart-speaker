@@ -1,12 +1,10 @@
-"""Optional escalation to a remote LLM or an external agent harness."""
+"""Optional escalation to a remote LLM."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-import shlex
 import time
 from collections.abc import AsyncIterator
 
@@ -69,47 +67,3 @@ class RemoteLLM:
             yield sentence
         log.info("remote round: %.2fs, first content %s, usage %s", time.monotonic() - t0,
                  f"{first:.2f}s" if first is not None else "-", usage)
-
-
-class Harness:
-    """Run a real command such as 'pi -p %p'; %p is replaced inside its argv element."""
-
-    def __init__(self, cfg: dict, cwd: str):
-        self.command = cfg["command"]
-        self.timeout = float(cfg.get("timeout", 300))
-        self.cwd = cwd
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.command.strip())
-
-    async def respond(self, prompt: str) -> AsyncIterator[str]:
-        args = shlex.split(self.command)
-        if not any("%p" in arg for arg in args):
-            raise RuntimeError("harness command must contain %p")
-        argv = [arg.replace("%p", prompt) for arg in args]
-        log.info("running harness: %s", self.command)
-        t0 = time.monotonic()
-        process = await asyncio.create_subprocess_exec(
-            *argv, cwd=self.cwd, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), self.timeout)
-        except TimeoutError as e:
-            raise RuntimeError(f"harness did not finish within {self.timeout:g}s") from e
-        finally:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-        if process.returncode:
-            detail = stderr.decode(errors="replace").strip()[-2000:]
-            raise RuntimeError(f"harness exited with {process.returncode}: {detail}")
-        text = stdout.decode(errors="replace").strip()
-        if not text:
-            raise RuntimeError("harness returned no output")
-        log.info("harness finished in %.2fs with %d characters", time.monotonic() - t0, len(text))
-        splitter = SentenceSplitter()
-        for sentence in splitter.feed(text):
-            yield sentence
-        for sentence in splitter.flush():
-            yield sentence

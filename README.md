@@ -1,6 +1,6 @@
 # Smart speaker
 
-A homemade, Yandex-Station-style voice assistant. Speech recognition, the default LLM and speech synthesis run locally; weather and Wikipedia lookups use the internet. Explicit requests can escalate to a remote LLM or an external agent harness.
+A homemade, Yandex-Station-style voice assistant. Speech recognition, the default LLM and speech synthesis run locally; weather and Wikipedia lookups use the internet. Explicit requests can escalate to a remote LLM, and coding agents (omp sessions) can be started and talked to by voice.
 
 The default character is a sarcastic Russian speaker woken by **«Эй, колонка»** (or just **«колонка»**). It answers **«Чё такое?»** to a bare wake phrase. Russian and English commands are supported. Wake phrases live in `[wake] phrases`; the small always-on wake model also needs their spellings in `[gate] grammar` (see the comment there). Use real words: a made-up wake word such as «гптшка» is biased into recognition everywhere, and Nemotron started hearing it in song names («газ гптшкат» for «Хас-Булат») and in loud music.
 
@@ -9,7 +9,7 @@ The default character is a sarcastic Russian speaker woken by **«Эй, коло
 - **Voice** (`speaker/voice/`): microphone capture, acoustic echo cancellation, wake/stop phrases, echo rejection, barge-in, follow-up listening and Silero TTS playback. The output device is opened only while something plays.
 - **Speech gate** (`speaker/voice/gate.py`): an energy check and Silero VAD (~2 MB) skip silence, and Vosk small Russian (~50 MB) detects the wake phrase. Two seconds of pre-roll preserve the complete command. Our own playback (plus a 0.5 s tail) is ignored so answers can't wake the speaker.
 - **ASR**: Nemotron 0.6B streaming through `nemo-speech`, on the Radeon iGPU via Vulkan. It activates after the small wake gate and stays active during an answer or ring. A Russian stream verifies the wake phrase and handles Russian commands; an optional auto-detect stream handles English once a conversation is open.
-- **Brain** (`speaker/brain/`): LFM3-1.7B through `llama-server` on the Radeon iGPU, with timers, alarms, volume, arithmetic, weather and Wikipedia tools. Common commands bypass the LLM. Optional escalation streams a larger OpenAI-compatible API model or runs a real agent command. Personal memory uses EmbeddingGemma 2 semantic search through a second `llama-server`.
+- **Brain** (`speaker/brain/`): LFM3-1.7B through `llama-server` on the Radeon iGPU, with timers, alarms, volume, arithmetic, weather and Wikipedia tools. Common commands bypass the LLM. Optional escalation streams a larger OpenAI-compatible API model. Personal memory uses EmbeddingGemma 2 semantic search through a second `llama-server`. omp coding-agent sessions connect to it as threads (`speaker/brain/agents.py`, `omp/speaker.ts`).
 - **Configuration**: one `config.toml` shared by every process.
 
 ## Setup
@@ -42,7 +42,7 @@ LFM3 GGUF files are published at `LiquidAI/LFM3-1.7B-GGUF` on Hugging Face. LFM3
 
 ### Optional escalation
 
-Both modes are disabled by default. With remote mode enabled, LFM3 can also call `ask_big_model` on its own for requests beyond its abilities. It then asks first («Это сложновато. Спросить большую модель?»): "да" sends the question to the big model, "нет" makes LFM3 answer itself. Any other request drops the question. Turn this off with `confirm = false`. Explicit requests («спроси большую модель…», `--big`) never ask.
+It is disabled by default. Once enabled, LFM3 can also call `ask_big_model` on its own for requests beyond its abilities. It then asks first («Это сложновато. Спросить большую модель?»): "да" sends the question to the big model, "нет" makes LFM3 answer itself. Any other request drops the question. Turn this off with `confirm = false`. Explicit requests («спроси большую модель…», `--big`) never ask.
 
 For a larger API model, set `enabled = true` in `[remote_llm]`, configure its OpenAI-compatible URL and model, and export the key:
 
@@ -51,17 +51,24 @@ export REMOTE_LLM_API_KEY=...
 speaker ask "Prove that there are infinitely many primes" --big
 ```
 
-For an actual agent harness, set `enabled = true` and its argv `command` in `[harness]`. Every `%p` argument is replaced with the prompt; no shell is involved:
+### Coding agents (omp)
 
-```toml
-command = "pi -p %p"
-```
+Every omp session that loads `omp/speaker.ts` connects to the brain (`ws://127.0.0.1:8770/omp`, or `$SPEAKER_BRAIN_URL`) and becomes a numbered thread; it retries quietly while the brain is down. Load it in every session:
 
 ```sh
-speaker ask "Inspect this repository and summarize its architecture" --harness
+mkdir -p ~/.omp/agent/extensions
+ln -s "$PWD/omp/speaker.ts" ~/.omp/agent/extensions/speaker.ts
 ```
 
-The harness supplies its own model authentication and tools. API and harness modes are mutually exclusive.
+- **«Запусти агента, …»** starts a new omp session in `[omp] cwd` with that task, in a detached tmux session (`tmux ls`, `tmux attach -t agent-1-…` to watch or type). Without a task it asks «Что сделать агенту?».
+- **«Скажи агенту …»** sends what follows as a message: it starts a turn, or steers the running one at its next step. It shows in the session as «[голосом через колонку] …».
+- **«Спроси агента …»** asks a side question, like `/btw`: answered from the session's context in a separate model call, without touching the running turn.
+- **«Какие агенты?»** lists the threads: number, title and whether each is working.
+- With several threads, name one by number: «скажи второму агенту …», «спроси агента три …». Without a number the request goes to the thread you last talked with or that last spoke, or to the only one.
+
+Once you have spoken to a session, its agent gets two tools: `speaker_say` (say something aloud: progress, the outcome) and `speaker_ask` (ask aloud and wait up to two minutes for the spoken answer; the speaker listens right after the question, and later answers need the wake phrase within 30 seconds). Sessions the speaker started have them from the start, and their built-in `ask` is redirected to `speaker_ask`, since nobody watches that terminal. When a run you asked for by voice ends without the agent speaking, the speaker says «Агент закончил.» and the start of its final answer. Agents' messages wait until you are done talking to the speaker, then play over ducked music; with several threads they start with «Агент два: …».
+
+Any omp session on the machine can be driven this way once the extension is installed, with the same tools and permissions as when you type into it; the brain listens on localhost only by default (`[brain] host`).
 
 ### Web search
 
@@ -190,7 +197,7 @@ Opens `config.toml` in a terminal editor: sections on the left, fields on the ri
 - Say **«Эй, колонка, поставь таймер на пять минут»**, or say the wake phrase alone and wait for the acknowledgement.
 - During speech or a ringing timer, any speech interrupts and becomes the next command; the wake phrase is not needed. A short **«стоп»**, **«хватит»** or another configured stop word just stops the response.
 - Ordinary answers return to idle. A follow-up without the wake phrase is accepted only when the speaker explicitly asked you a question. Requests have no conversation history; only timers, alarms and volume persist.
-- Start with **«спроси большую модель»** to use `[remote_llm]`, or **«запусти агента»** to run `[harness]`. English triggers are also configured.
+- Start with **«спроси большую модель»** to use `[remote_llm]`; **«запусти агента»**, **«скажи агенту»** and **«спроси агента»** reach omp threads (see Coding agents). English triggers also work.
 - Volume commands use levels 0–10. Timers and alarms persist in `state/brain.json`; personal memories persist in `state/memory.sqlite3`.
 - Smart-home control is not implemented.
 

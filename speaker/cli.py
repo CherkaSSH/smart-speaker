@@ -109,9 +109,7 @@ def main() -> None:
     sub.add_parser("yandex-login", help="sign in to Yandex Music and print the token to export")
     ask = sub.add_parser("ask", help="ask the running brain in text")
     ask.add_argument("text")
-    mode = ask.add_mutually_exclusive_group()
-    mode.add_argument("--big", action="store_true", help="use the configured remote LLM")
-    mode.add_argument("--harness", action="store_true", help="run the configured agent harness")
+    ask.add_argument("--big", action="store_true", help="use the configured remote LLM")
     ask.add_argument("--speak", action="store_true", help="also say it through the voice service")
     args = ap.parse_args()
 
@@ -142,7 +140,7 @@ def main() -> None:
         b = cfg["brain"]
         req = urllib.request.Request(f"http://{b['host']}:{b['port']}/ask",
                                      json.dumps({"text": args.text, "speak": args.speak,
-                                                 "big": args.big, "harness": args.harness}).encode(),
+                                                 "big": args.big}).encode(),
                                      {"Content-Type": "application/json"})
         print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, indent=1))
 

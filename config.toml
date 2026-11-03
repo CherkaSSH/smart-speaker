@@ -175,14 +175,17 @@ timeout = 15
 # search results ("Пусть ответит большая модель?") instead of LFM3.
 offer_big_model = true
 
-[harness]
-# A real argv command, not a shell string. Every %p is replaced with the user
-# prompt, e.g. 'pi -p %p'. Authentication and tools belong to that harness.
-enabled = false
-command = "pi -p %p"
-cwd = "."
-timeout = 300
-triggers = ["запусти агента", "используй агента", "use the harness", "run the harness"]
+[omp]
+# Coding-agent threads you talk to by voice. omp sessions that load
+# omp/speaker.ts (symlinked into ~/.omp/agent/extensions/) connect to the
+# brain's /omp endpoint: «скажи агенту …» sends a message, «спроси агента …»
+# a side question, «какие агенты?» lists them. «запусти агента …» starts a new
+# session with that task in a detached tmux session (`tmux ls`, then attach).
+enabled = true
+# Where new threads start.
+cwd = "~/projects"
+# The command a new thread runs in tmux (argv); omp, plus any flags.
+command = ["omp"]
 
 [memory]
 # EmbeddingGemma 2 (Q8_0 GGUF from ggml-org/embeddinggemma-2-GGUF) served by

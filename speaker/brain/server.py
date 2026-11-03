@@ -4,14 +4,19 @@ Protocol (JSON text frames):
   voice -> brain  {"type": "hello"}
                   {"type": "utterance", "id": str, "text": str, "lang": "ru"|"en"}
                   {"type": "cancel"}            stop the current answer (barge-in, "стоп")
+                  {"type": "listening", "id": str}   a follow-up window opened after turn or speak `id`
   brain -> voice  {"type": "volume", "level": 0..10}
                   {"type": "say", "id": str, "text": str, "lang": str}
                   {"type": "turn_end", "id": str, "expect_reply": bool}
                   {"type": "ring", "text": str, "lang": str}   a timer or alarm went off
-                  {"type": "ask", "text": str, "lang": str}    a question of the speaker's own («Включить
-                                                               мою волну?»); the reply comes as an utterance
+                  {"type": "speak", "id": str, "sentences": [str], "lang": str, "queue": bool,
+                   "expect_reply": bool}   said on the speaker's own initiative («Включить мою волну?», an
+                                           agent's message); with `queue` it waits until the speaker is free,
+                                           otherwise it is dropped when busy; a reply comes as an utterance
 
-HTTP: POST /ask {"text", "lang"?, "speak"?, "big"?, "harness"?} answers in JSON,
+Coding-agent threads (omp sessions) connect to /omp; see agents.py and omp/speaker.ts.
+
+HTTP: POST /ask {"text", "lang"?, "speak"?, "big"?} answers in JSON,
 for testing without audio; "speak": true also sends it to the voice service.
 """
 
@@ -24,6 +29,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from aiohttp import WSMsgType, web
@@ -31,12 +37,14 @@ from aiohttp import WSMsgType, web
 from ..config import Config
 from ..lang import detect as detect_lang
 from . import intents, speech
-from .escalate import Harness, RemoteLLM
+from .agents import Agents
+from .escalate import RemoteLLM
 from .llm import LLM
 from .memory import Memory
 from .music import MY_WAVE, Music, asks_for_music
 from .timers import Item, Scheduler
 from .tools import BIG_MODEL_SCHEMA, SCHEMAS, WEB_SEARCH_SCHEMA, Tools
+from .text import SentenceSplitter
 from .websearch import WebSearch
 
 log = logging.getLogger("brain")
@@ -71,7 +79,7 @@ class NeedsConfirmation(Exception):
 
 @dataclass
 class Pending:
-    kind: str  # "big", "search" or "music"
+    kind: str  # "big", "search", "music" or "reply"
     messages: list[dict]  # the conversation up to and including the paused tool call
     call_id: str
     args: dict
@@ -79,10 +87,14 @@ class Pending:
     lang: str
     search: asyncio.Task | None = None  # web search already running while the user answers
     expires: float = field(default_factory=lambda: time.monotonic() + CONFIRM_SECONDS)
+    # "reply": takes the user's next words as they are (None when they never came) and returns what to say
+    reply: Callable[[str | None], Awaitable[str | None]] | None = None
 
     def cancel(self) -> None:
         if self.search:
             self.search.cancel()
+        if self.reply:
+            asyncio.ensure_future(self.reply(None))
 
 
 RULES = """
@@ -126,19 +138,21 @@ class Brain:
         # The remote model gets no tool definitions: it must not try to call any.
         self.remote_system = self.system + "- In this conversation you have no tools: answer directly from what you know " \
                                            "and from any information given in the message.\n"
-        r, h = cfg["remote_llm"], cfg["harness"]
+        r = cfg["remote_llm"]
         self.memory = Memory(cfg["memory"], cfg.file(cfg["memory"]["state_file"]))
         self.remote = RemoteLLM(r) if r["enabled"] else None
-        self.harness = Harness(h, str(cfg.file(h["cwd"]))) if h["enabled"] else None
         self.big_triggers = r["triggers"]
-        self.harness_triggers = h["triggers"]
+        b = cfg["brain"]
+        host = "127.0.0.1" if b["host"] in ("0.0.0.0", "::", "") else b["host"]
+        self.agents = Agents(self, cfg["omp"], f"ws://{host}:{b['port']}/omp")
         self.web = WebSearch(cfg["web_search"])
         self.music = Music(self, cfg["music"], cfg.file(cfg["music"]["library"]))
         self.confirm_big = bool(r["confirm"])
         self.offer_big_for_search = bool(cfg["web_search"]["offer_big_model"])
         self.schemas = SCHEMAS + ([WEB_SEARCH_SCHEMA] if self.web.enabled else []) \
             + ([BIG_MODEL_SCHEMA] if self._big_ready else [])
-        self.pending: Pending | None = None  # a question the speaker asked and awaits yes/no for
+        self.pending: Pending | None = None  # a question the speaker asked and awaits an answer to
+        self.awaiting: dict[str, Pending] = {}  # questions sent to the voice service, not yet asked aloud
         self.clients: set[web.WebSocketResponse] = set()
         self.turn: asyncio.Task | None = None
         self._load()
@@ -185,14 +199,42 @@ class Brain:
         log.info("ring: %s", text)
         await self.broadcast({"type": "ring", "text": text, "lang": item.lang})
 
-    async def offer(self, kind: str, question: str, lang: str) -> None:
-        """Ask on the speaker's own initiative (the songs the user asked for ended); the next
-        utterance's yes or no resolves it, like the speaker's other questions."""
+    def expect_reply(self, lang: str, reply: Callable[[str | None], Awaitable[str | None]]) -> Pending:
+        """A question whose answer is the user's next words, whatever they are."""
+        return Pending("reply", [], "", {}, "", lang, reply=reply)
+
+    async def speak(self, text: str, lang: str, *, queue: bool, pending: Pending | None = None) -> None:
+        """Say something on the speaker's own initiative. With `queue`, it waits until the speaker is
+        free; otherwise it is dropped if the user is busy with it. With `pending`, the speaker listens
+        afterwards and the reply resolves it, like the answers to the speaker's other questions."""
+        sid = uuid.uuid4().hex[:8]
+        now = time.monotonic()
+        for old, p in list(self.awaiting.items()):  # never said: the voice service dropped or lost them
+            if p.expires < now - 3600:
+                del self.awaiting[old]
+                p.cancel()
+        if pending:
+            self.awaiting[sid] = pending
+        splitter = SentenceSplitter()
+        sentences = splitter.feed(text) + splitter.flush()
+        log.info("speaking%s: %s", " (queued)" if queue else "", text)
+        await self.broadcast({"type": "speak", "id": sid, "sentences": sentences, "lang": lang, "queue": queue,
+                              "expect_reply": pending is not None})
+
+    def _listening(self, sid: str) -> None:
+        """The voice service said question `sid` and now listens: its answer is the next utterance."""
+        p = self.awaiting.pop(sid, None)
+        if p is None:
+            return
         if self.pending:
             self.pending.cancel()
-        self.pending = Pending(kind, [], "", {}, question, lang)
-        log.info("asking: %s", question)
-        await self.broadcast({"type": "ask", "text": question, "lang": lang})
+        p.expires = time.monotonic() + CONFIRM_SECONDS
+        self.pending = p
+
+    async def offer(self, kind: str, question: str, lang: str) -> None:
+        """Ask on the speaker's own initiative (the songs the user asked for ended), unless the user
+        is busy with it; the next utterance's yes or no resolves it."""
+        await self.speak(question, lang, queue=False, pending=Pending(kind, [], "", {}, question, lang))
 
     # Turns -------------------------------------------------------------
     def _stamp(self, lang: str) -> str:
@@ -210,49 +252,41 @@ class Brain:
                     return tail.lstrip(" \t\r\n,:;—-")
         return None
 
-    async def answer(self, text: str, lang: str, big: bool = False, harness: bool = False):
+    async def answer(self, text: str, lang: str, big: bool = False):
         """Yield the spoken answer to one utterance, sentence by sentence."""
         pending, self.pending = self.pending, None
         if pending:
-            choice = yes_no(text) if not (big or harness) and time.monotonic() < pending.expires else None
+            live = not big and time.monotonic() < pending.expires
+            if pending.reply and live:
+                log.info("reply to the speaker's question: %r", text)
+                said = await pending.reply(text)
+                if said:
+                    yield said
+                return
+            choice = yes_no(text) if live and not pending.reply else None
             if choice is not None:
                 log.info("confirmation %s: %s", pending.kind, "yes" if choice else "no")
                 async for sentence in self._resolve(pending, choice):
                     yield sentence
                 return
             pending.cancel()  # the user moved on to something else
-        if big and harness:
-            raise ValueError("big and harness are mutually exclusive")
-        mode = "big" if big else "harness" if harness else ""
-        prompt = text
-        if mode:
-            triggers = self.big_triggers if big else self.harness_triggers
-            stripped = self._trigger(text, triggers)
-            if stripped is not None:
-                prompt = stripped
-        else:
-            for candidate, triggers in (("big", self.big_triggers), ("harness", self.harness_triggers)):
-                stripped = self._trigger(text, triggers)
-                if stripped is not None:
-                    mode, prompt = candidate, stripped
-                    break
-        if mode:
+        prompt = self._trigger(text, self.big_triggers)
+        if big or prompt is not None:
+            prompt = text if prompt is None else prompt
             if not prompt:
                 yield "Что передать?" if lang == "ru" else "What should I pass along?"
-            elif mode == "big":
-                if not self.remote or not self.remote.configured:
-                    yield "Большая модель не настроена." if lang == "ru" else "The big model is not configured."
-                else:
-                    messages = [{"role": "system", "content": self.remote_system},
-                                {"role": "user", "content": f"{self._stamp(lang)} {prompt}"}]
-                    async for sentence in self.remote.respond(messages):
-                        yield sentence
+            elif not self.remote or not self.remote.configured:
+                yield "Большая модель не настроена." if lang == "ru" else "The big model is not configured."
             else:
-                if not self.harness or not self.harness.configured:
-                    yield "Внешний агент не настроен." if lang == "ru" else "The external harness is not configured."
-                else:
-                    async for sentence in self.harness.respond(prompt):
-                        yield sentence
+                messages = [{"role": "system", "content": self.remote_system},
+                            {"role": "user", "content": f"{self._stamp(lang)} {prompt}"}]
+                async for sentence in self.remote.respond(messages):
+                    yield sentence
+            return
+        reply = await self.agents.handle(text, lang)
+        if reply is not None:
+            log.info("agent command: %r -> %r", text, reply)
+            yield reply
             return
         if self.fast_commands:
             reply = await intents.handle(self, text, lang)
@@ -347,12 +381,11 @@ class Brain:
         async for sentence in self._llm(p.messages, p.text, p.lang, local, confirm=False):
             yield sentence
 
-    async def _run_turn(self, turn_id: str, text: str, lang: str,
-                        big: bool = False, harness: bool = False) -> None:
+    async def _run_turn(self, turn_id: str, text: str, lang: str, big: bool = False) -> None:
         said = []
         t0 = time.monotonic()
         try:
-            async for sentence in self.answer(text, lang, big=big, harness=harness):
+            async for sentence in self.answer(text, lang, big=big):
                 if not said:
                     log.info("first sentence after %.2fs", time.monotonic() - t0)
                 said.append(sentence)
@@ -367,11 +400,10 @@ class Brain:
         await self.broadcast({"type": "turn_end", "id": turn_id,
                               "expect_reply": bool(said) and said[-1].rstrip().endswith("?")})
 
-    def start_turn(self, turn_id: str, text: str, lang: str,
-                   big: bool = False, harness: bool = False) -> None:
+    def start_turn(self, turn_id: str, text: str, lang: str, big: bool = False) -> None:
         self.cancel_turn()
         log.info("utterance %s [%s]: %s", turn_id, lang, text)
-        self.turn = asyncio.create_task(self._run_turn(turn_id, text, lang, big, harness))
+        self.turn = asyncio.create_task(self._run_turn(turn_id, text, lang, big))
 
     def cancel_turn(self) -> None:
         if self.turn and not self.turn.done():
@@ -397,6 +429,8 @@ class Brain:
                     self.cancel_turn()
                 elif kind == "music_event":
                     await self.music.on_event(d["event"], d["id"], d.get("detail", ""))
+                elif kind == "listening":
+                    self._listening(d.get("id", ""))
         finally:
             self.clients.discard(ws)
             log.info("voice disconnected")
@@ -406,17 +440,15 @@ class Brain:
         d = await request.json()
         text = d["text"]
         lang = d.get("lang") or detect_lang(text)
-        big, harness = bool(d.get("big")), bool(d.get("harness"))
-        if big and harness:
-            return web.json_response({"error": "big and harness are mutually exclusive"}, status=400)
+        big = bool(d.get("big"))
         if d.get("speak"):
             turn_id = uuid.uuid4().hex[:8]
-            self.start_turn(turn_id, text, lang, big, harness)
+            self.start_turn(turn_id, text, lang, big)
             await self.turn
             return web.json_response({"id": turn_id})
         t0 = time.monotonic()
         out, first = [], None
-        async for s in self.answer(text, lang, big=big, harness=harness):
+        async for s in self.answer(text, lang, big=big):
             first = first or time.monotonic() - t0
             out.append(s)
         return web.json_response({"text": " ".join(out), "sentences": out,
@@ -428,7 +460,8 @@ class Brain:
 async def serve(cfg: Config) -> None:
     brain = Brain(cfg)
     app = web.Application()
-    app.add_routes([web.get("/ws", brain.ws_handler), web.post("/ask", brain.ask_handler)])
+    app.add_routes([web.get("/ws", brain.ws_handler), web.post("/ask", brain.ask_handler),
+                    web.get("/omp", brain.agents.ws_handler)])
     runner = web.AppRunner(app)
     await runner.setup()
     b = cfg["brain"]

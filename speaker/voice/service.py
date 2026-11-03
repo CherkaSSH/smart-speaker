@@ -16,6 +16,7 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from difflib import SequenceMatcher
 
 import aiohttp
@@ -89,6 +90,7 @@ class Voice:
         self.spoken: list[tuple[float, float, list[str]]] = []  # (start, end, phonetic words) of our recent speech
         self.play_end = 0.0  # estimated end of everything queued for playback
         self.ring_task: asyncio.Task | None = None
+        self.waiting: deque[dict] = deque()  # the brain's own messages to say once the speaker is free
         self.ws: aiohttp.ClientWebSocketResponse | None = None
         self.alt_finals: list[Final] = []  # recent finals of the language-detecting stream
         self.ignore_before = 0.0  # audio at or before this time already belongs to an older turn
@@ -130,6 +132,8 @@ class Voice:
             self.state = state
             self._set_streams_active(state != "idle")
             self._update_duck()
+        if state == "idle" and self.turn_id is None and self.waiting:
+            self.announce(self.waiting.popleft())
 
     def _update_duck(self) -> None:
         """Music is quiet whenever we listen to or talk with the user."""
@@ -361,13 +365,19 @@ class Voice:
         elif kind == "ring":
             await self.interrupt("ring")
             self.ring_task = asyncio.create_task(self.ring(msg["text"]))
-        elif kind == "ask":  # a question of the brain's own («Включить мою волну?»): say it, then listen
-            if self.state != "idle":
-                log.info("not asking %r: %s", msg["text"], self.state)  # the user is busy with something else
-                return
-            self.turn_id = uuid.uuid4().hex[:8]
-            await self.speech.put((self.turn_id, msg["text"], False))
-            await self.speech.put((self.turn_id, None, True))
+        elif kind == "speak":  # the brain speaks on its own: an agent's message, «Включить мою волну?»
+            if self.state == "idle" and self.turn_id is None:
+                self.announce(msg)
+            elif msg.get("queue"):
+                self.waiting.append(msg)  # said once the user is done with the speaker
+            else:
+                log.info("not saying %r: %s", " ".join(msg["sentences"]), self.state)
+
+    def announce(self, msg: dict) -> None:
+        self.turn_id = msg["id"]
+        for sentence in msg["sentences"]:
+            self.speech.put_nowait((msg["id"], sentence, False))
+        self.speech.put_nowait((msg["id"], None, bool(msg.get("expect_reply"))))
 
     async def on_music_command(self, msg: dict) -> None:
         action = msg["action"]
@@ -410,6 +420,7 @@ class Voice:
                 if expect_reply:
                     self.play(sounds.listen_start(), sounds.RATE)
                     self.listen(self.follow_up_seconds, "answer was a question")
+                    await self.send({"type": "listening", "id": turn})
                 else:
                     self.set_state("idle", "answered")
                 continue
