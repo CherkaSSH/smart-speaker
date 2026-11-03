@@ -31,8 +31,12 @@ SCHEMAS = [
     _fn("set_alarm", "Set an alarm clock for a time of day.",
         {"time": {"type": "string", "description": "24-hour HH:MM"},
          "date": {"type": "string", "description": "YYYY-MM-DD; omit for the next occurrence of that time"},
-         "label": {"type": "string"}},
+         "label": {"type": "string"},
+         "music": {"type": "string", "description": "Wake up to this music: an artist or song as the user said it, "
+                                                    "empty for any music. Omit for an alarm that only rings"}},
         ["time"]),
+    _fn("set_sleep_timer", "Stop the music after a while. Use for 'turn off the music in 30 minutes' and sleep timers.",
+        {"seconds": {"type": "integer", "description": "Length in seconds"}}, ["seconds"]),
     _fn("list_timers", "List running timers and alarms with the time left.", {}),
     _fn("cancel_timers", "Cancel timers or alarms.",
         {"which": {"type": "string", "description": "'all', a label, or 'timer'/'alarm' for every one of that kind"}},
@@ -53,6 +57,10 @@ SCHEMAS = [
         {"expression": {"type": "string", "description":
                         "Python-style expression, e.g. '27*4', 'sqrt(2)', or days_until('2027-01-01') for days from today"}},
         ["expression"]),
+    _fn("exchange_rate", "Today's Central Bank of Russia exchange rate, or what an amount of a currency is in rubles.",
+        {"currency": {"type": "string", "description": "Currency name or ISO code, e.g. 'доллар', 'USD', 'евро'"},
+         "amount": {"type": "number", "description": "How much to convert; omit for the rate itself"}},
+        ["currency"]),
     _fn("save_memory", "Save durable personal information or a preference when the user asks to remember it, "
         "or when it will clearly be useful in later requests. Do not save transient commands.",
         {"text": {"type": "string", "description": "Self-contained fact to remember"}}, ["text"]),
@@ -158,7 +166,7 @@ class Tools:
         item = self.brain.scheduler.add("timer", time.time() + seconds, self.lang, label, seconds)
         return {"ok": True, "timer_id": item.id, "length": speech.duration(seconds, self.lang), "label": item.label}
 
-    async def t_set_alarm(self, time: str, date: str = "", label: str = "") -> dict:
+    async def t_set_alarm(self, time: str, date: str = "", label: str = "", music: str | None = None) -> dict:
         hh, mm = (int(x) for x in time.strip().split(":")[:2])
         now = dt.datetime.now()
         if date:
@@ -169,20 +177,32 @@ class Tools:
                 when += dt.timedelta(days=1)
         if when <= now:
             return {"error": "that time has passed"}
-        item = self.brain.scheduler.add("alarm", when.timestamp(), self.lang, label)
+        item = self.brain.scheduler.add("alarm", when.timestamp(), self.lang, label, music=music)
         return {"ok": True, "alarm_id": item.id, "rings_at": when.strftime("%Y-%m-%d %H:%M"),
-                "in": speech.duration(int((when - now).total_seconds()) // 60 * 60, self.lang)}
+                "in": speech.duration(int((when - now).total_seconds()) // 60 * 60, self.lang),
+                **({"music": item.music} if item.music is not None else {})}
+
+    async def t_set_sleep_timer(self, seconds: int) -> dict:
+        seconds = int(seconds)
+        if seconds <= 0:
+            return {"error": "seconds must be positive"}
+        self.brain.scheduler.cancel(self.brain.scheduler.pending("sleep"))  # one sleep timer at a time
+        item = self.brain.scheduler.add("sleep", time.time() + seconds, self.lang, "", seconds)
+        return {"ok": True, "sleep_timer_id": item.id, "length": speech.duration(seconds, self.lang)}
 
     async def t_list_timers(self) -> dict:
         items = self.brain.scheduler.pending()
         return {"items": [{"kind": i.kind, "label": i.label, "left": speech.duration(i.remaining(), self.lang),
-                           "at": dt.datetime.fromtimestamp(i.due).strftime("%H:%M")} for i in items]}
+                           "at": dt.datetime.fromtimestamp(i.due).strftime("%H:%M"),
+                           **({"music": i.music} if i.music is not None else {})} for i in items]}
 
     async def t_cancel_timers(self, which: str = "all") -> dict:
         which = which.strip().lower()
         items = self.brain.scheduler.pending()
         if which in ("timer", "timers", "таймер", "таймеры"):
             items = [i for i in items if i.kind == "timer"]
+        elif which in ("sleep", "sleep timer", "таймер сна", "сон"):
+            items = [i for i in items if i.kind == "sleep"]
         elif which in ("alarm", "alarms", "будильник", "будильники"):
             items = [i for i in items if i.kind == "alarm"]
         elif which not in ("all", "все", "всё"):
@@ -263,6 +283,17 @@ class Tools:
         elif isinstance(value, float):
             value = round(value, 4)
         return {"result": value}
+
+    async def t_exchange_rate(self, currency: str, amount: float | None = None) -> dict:
+        code = self.brain.rates.code(currency) or (currency.strip().upper() if len(currency.strip()) == 3 else None)
+        if not code:
+            return {"error": f"unknown currency {currency!r}"}
+        said = await self.brain.rates.say(code, amount, self.lang)
+        if said is None:
+            return {"error": f"the Central Bank does not quote {code}"}
+        rate = (await self.brain.rates.values())[code]
+        return {"currency": code, "rate_rubles": round(rate, 4), "amount": amount,
+                "rubles": round(rate * (amount or 1), 2), "spoken": said}
 
     # Memory and escalation ----------------------------------------------
     async def t_save_memory(self, text: str) -> dict:

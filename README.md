@@ -83,9 +83,11 @@ While a slow tool runs (web search, Wikipedia, weather, big model) the speaker s
 
 Say «включи музыку» (shuffle the library), «включи май бонни» (a song or artist; Cyrillic spellings of Latin titles work), «включи радио» or «включи радио секрет эйджент» (internet radio from `[music] radio`), then «пауза», «продолжи», «следующая», «предыдущая», «что играет?», «выключи музыку». Each needs the wake phrase, as on Yandex Station. Pause, resume and skip act silently. Anything vaguer goes to LFM3 through the `play_music` and `music_control` tools; when nothing matches, it gets the library's titles and can retry. Waves, radio and «включи музыку» play on without end (a new shuffle, the next wave batch).
 
+More commands: «какие слова?», «какой там текст?» and «о чём поётся» read out the line that is playing and the next one when the track has timed (LRC) lyrics and the playback position is known, otherwise the first two to four lines, and «нет текста» when the song has none. «мне нравится»/«поставь лайк» likes the current Yandex Music track, «не нравится»/«дизлайк» marks it «не рекомендовать» and skips to the next track; tracks from a wave also send the app's rotor feedback, and other sources answer that likes only work in Yandex Music. «повтори этот трек»/«поставь на повтор» repeats the current track until «выключи повтор» or another request, «перемешай» shuffles the rest of a queue (a wave answers that there is nothing to shuffle), and «включи режим диджея»/«выключи режим диджея» turn on and off saying «Дальше: …» before each next track (`[music] announce`, off by default; audiobook chapters and radio are never announced). «включи подкаст <название>» plays the latest episodes of the best-matching Yandex Music podcast, newest first.
+
 When the songs you asked for by name end (one song, or all of an artist's or album's), `[music] after_request` decides what happens: `"ask"` (the default) asks «Включить мою волну?» and listens as after any question; «да» starts it, «нет» answers «Ладно», and anything else drops the question. `"continue"` starts it without asking, `"stop"` stops. It is My Wave when Yandex Music has a token, otherwise more from the same source («Включить ещё музыку?»). «следующая» on the last requested song goes straight on. The question is the brain's own `ask` message to the voice service, which says it only when idle (not in the middle of another conversation).
 
-The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title`, `artist` and `album`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. With `echo_cancellation = false`, lyrics are added to echo removal while the song plays, so sung words are not taken for your voice. With it on, the canceller removes the singer, and lyric words in a transcript are yours («включи хас булат удалой» over Хас-Булат).
+The library is `music/` (any format ffmpeg reads). Optional sidecars per file: `NAME.json` with `title`, `artist` and `album`, and `NAME.txt` with the lyrics. Without a `.json`, the file's own tags are used. With `echo_cancellation = false`, lyrics are added to echo removal while the song plays, so sung words are not taken for your voice. With it on, the canceller removes the singer, and lyric words in a transcript are yours («включи хас булат удалой» over Хас-Булат). Yandex Music brings the text lyrics of a streamed track along with it the same way, and keeps the timed ones for «какие слова?».
 
 `music/` is not in git. The test library is four public-domain recordings with vocals from Wikimedia Commons, each with lyrics and metadata sidecars:
 
@@ -118,6 +120,8 @@ Yandex's radio is its waves, each an endless stream in batches of five:
 | «следующая» at the end of a batch | the next batch |
 
 Wave names are matched by whole words and Russian stems (тренировки → Тренируюсь, рэп → Русский рэп). A name needs 0.8 similarity, and a name under four letters must match whole, so «радио groove salad» still reaches the internet station and «музыку ддт» plays ДДТ instead of the «Даб» wave. «…музыку» with a description tries a wave first, then a normal search («музыку битлз»). Like the app, the speaker reports each started, finished and skipped wave track: without that, 7–9 of 20 tracks in the next batches repeated; with it, none did, and skips teach My Wave.
+
+**Audiobooks** come from Yandex Books (through the [`yandex-book-api`](https://github.com/stepan163s/yandex-book-api) library) with the same Yandex token, no extra login. Say «включи аудиокнигу мастер и маргарита», «почитай книгу …» or «включи книгу …»: the speaker picks the best-matching audiobook, plays one chapter per queue item (titled «Мастер и Маргарита, глава 3»), and says «Включаю аудиокнигу «…», глава N.» «следующая глава» and «предыдущая глава» work like next/previous, and «что за книга?» names the book and chapter. Chapters are signed HLS streams resolved right before each one plays. The brain saves the chapter and the second you stopped at in `[music] books.state_file` (`state/books.json`), on pause, stop, skip, chapter change, and every 30 seconds while playing: «включи аудиокнигу …» starts that book where you left it (chapter 1 the first time) and «продолжи книгу» resumes the most recent one. The last chapter stops the queue with «Книга закончилась.» rather than offering My Wave. Books are only searched for these explicit requests, so «включи музыку» and song titles never return chapters.
 
 Spotify doesn't hand out stream URLs, so it would need a Spotify Connect receiver such as librespot instead of a provider.
 
@@ -199,7 +203,25 @@ Opens `config.toml` in a terminal editor: sections on the left, fields on the ri
 - During speech or a ringing timer, any speech interrupts and becomes the next command; the wake phrase is not needed. A short **«стоп»**, **«хватит»** or another configured stop word just stops the response.
 - Ordinary answers return to idle. A follow-up without the wake phrase is accepted only when the speaker explicitly asked you a question. Requests have no conversation history; only timers, alarms and volume persist.
 - Start with **«спроси большую модель»** to use `[remote_llm]`; **«запусти агента»**, **«скажи агенту»** and **«спроси агента»** reach omp threads (see Coding agents). English triggers also work.
-- Volume commands use levels 0–10. Timers and alarms persist in `state/brain.json`; personal memories persist in `state/memory.sqlite3`.
+- Volume commands use levels 0–10. Timers, alarms and the sleep timer persist in `state/brain.json`; the shopping list in `state/shopping.json`; personal memories in `state/memory.sqlite3`; audiobook places in `state/books.json`.
 - Smart-home control is not implemented.
 
 Tune wake matching, stop words, microphone gain, output channels, TTS voices, endpoint silence, the 4096-token generation ceiling, escalation backends and the character prompt in `config.toml`, by hand or with `speaker settings`.
+
+## Everyday extras
+
+These commands are answered instantly, without the LLM, like timers and the clock.
+
+**Sleep timer.** «выключи музыку через 30 минут», «останови музыку через 10 минут», «таймер сна на час» or "turn off the music in 30 minutes": when the time comes the music stops silently, with no ring. There is one sleep timer at a time; a new one replaces it, and «отмени таймер сна» cancels it. It persists in `state/brain.json` like the other timers.
+
+**Alarms with music.** «разбуди меня в 7 под Кино» and «поставь будильник на 7:30 с музыкой» store the artist or song (or «с музыкой» = any music) on the alarm. When it fires the speaker says «Подъём, будильник!» and starts the music; a plain alarm only rings. The LLM's `set_alarm` tool takes the same optional `music` argument, and `set_sleep_timer` and `exchange_rate` cover the other free phrasing. Alarms persist with their music in `state/brain.json`.
+
+**Morning show.** «доброе утро», «утреннее шоу» or «включи утреннее шоу» (also "good morning" / "morning show") answers in one go: a greeting for the time of day, the clock, today's weather from `[brain] home_city`, the alarms and reminders still due today, three headlines from `[news]`, then «Включаю музыку» and My Wave or a library shuffle.
+
+**News.** «что нового?», «новости», «расскажи новости» (or "what's new", "headlines") read the five latest headlines from the RSS feeds in `[news] feeds_ru`, or `feeds_en` for English answers, taking a few from each feed in turn. Headlines are cached for `cache_minutes`; if every feed fails the last batch is reused. No API key and no LLM are involved.
+
+**Exchange rates.** «курс доллара», «курс евро», «сколько стоит юань», «сколько будет 100 долларов в рублях» answer from the Central Bank of Russia's daily rates (`cbr-xml-daily.ru`, falling back to `cbr.ru`), cached for an hour: «Доллар — восемьдесят один рубль шестьдесят семь копеек.» The `exchange_rate` tool does the same for free phrasing. Currencies without a rate in the bank's list are reported as such.
+
+**Shopping list.** «добавь молоко в список покупок», «добавь в список покупок хлеб и яйца», «что в списке покупок?», «удали молоко из списка покупок», «очисти список покупок». Items are added one per phrase part, listed in the order they were added, removed by fuzzy word match (the first four letters, so «молока» removes «молоко»), and kept in the JSON file named by `[shopping] state_file` across restarts.
+
+**Translation.** «как по-английски яблоко», «переведи на английский я люблю музыку», «как будет спасибо по-немецки» get a one-line translation («Перевод: danke»). A short dedicated prompt is sent to LFM3 with no tools, because the chat prompt alone made it define the word, call Wikipedia, or answer German wrongly in testing.

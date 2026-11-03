@@ -55,6 +55,7 @@ class Track:
     live: bool = False  # a radio stream: no end, resume reconnects
     source: str = ""  # filled by the provider's resolve() right before playback
     station: str = ""  # the wave it came from («Рок», «Моя волна»): more comes from there
+    start: float = 0.0  # seconds into the source to start at (book resume, clip quizzes)
 
     def label(self, lang: str) -> str:
         """How the speaker names the track aloud: no "(Feodor Chaliapin)" asides."""
@@ -124,6 +125,19 @@ _ASKS_FOR_MUSIC = re.compile(r"\b(включ\w*|постав\w*|сыгра\w*|и
 
 def asks_for_music(text: str) -> bool:
     return bool(_ASKS_FOR_MUSIC.search(text))
+
+
+_LRC_LINE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]\s?(.*)")
+
+
+def parse_lrc(text: str) -> list[tuple[float, str]]:
+    """Timed lyrics as (seconds, line), sorted: Yandex's LRC looks like ``[00:31.80] Тёплое место…``."""
+    lines = []
+    for raw in text.splitlines():
+        m = _LRC_LINE.match(raw.strip())
+        if m and m.group(3).strip():
+            lines.append((int(m.group(1)) * 60 + float(m.group(2)), m.group(3).strip()))
+    return sorted(lines)
 
 
 def rank(query: str, tracks: list[Track], limit: int) -> list[Track]:
@@ -322,6 +336,8 @@ class YandexMusic:
         self._seeded: dict[str, str] = {}  # «по треку …» -> rotor id: waves started from a song, not searchable
         self._wave_last: dict[str, str] = {}  # rotor id -> last track handed out: the next batch follows it
         self._batches: dict[str, tuple[str, str]] = {}  # track id -> (rotor id, batch id), for feedback
+        self._lrc: dict[str, list[tuple[float, str]]] = {}  # track id -> timed lyrics, fetched on demand
+        self._no_lyrics: set[str] = set()  # podcast episodes: not songs, no point asking for lyrics
 
     @property
     def token(self) -> str:
@@ -384,7 +400,7 @@ class YandexMusic:
         return [self._track(t, station) for t in found]
 
     async def feedback(self, track: Track, event: str, seconds: float = 0.0) -> None:
-        """started, finished or skipped, for a track from a wave."""
+        """started, finished, skipped, like or dislike, for a track from a wave."""
         if track.id not in self._batches:
             return
         sid, batch = self._batches[track.id]
@@ -395,6 +411,67 @@ class YandexMusic:
             await self._retry(lambda: api.rotor_station_feedback_track_finished(sid, track.id, seconds, batch))
         elif event == "skipped":
             await self._retry(lambda: api.rotor_station_feedback_skip(sid, track.id, seconds, batch))
+        elif event in ("like", "dislike"):  # the same events the app sends from a wave
+            await self._retry(lambda: api.rotor_station_feedback(sid, event, track_id=track.id, batch_id=batch,
+                                                                total_played_seconds=seconds))
+
+    async def like(self, track: Track) -> None:
+        api = await self._api()
+        await self._retry(lambda: api.users_likes_tracks_add(track.id))
+
+    async def dislike(self, track: Track) -> None:
+        api = await self._api()
+        await self._retry(lambda: api.users_dislikes_tracks_add(track.id))
+
+    async def lyrics_text(self, track: Track) -> str:
+        """The plain text of a song, or "" (the track has none, or the request failed)."""
+        if track.id in self._no_lyrics:
+            return ""
+        api = await self._api()
+        if not api.token:
+            return ""
+        try:
+            lyrics = await self._retry(lambda: api.tracks_lyrics(track.id, format_="TEXT"))
+            return (await self._retry(lyrics.fetch_lyrics_async)).strip() if lyrics is not None else ""
+        except Exception as e:  # no text is normal; playback must go on
+            log.info("no lyrics for %s: %s", track.label("en"), e)
+            return ""
+
+    async def timed_lyrics(self, track: Track) -> list[tuple[float, str]]:
+        """The song's lines with their start times, or [] (no synchronized lyrics). Fetched once."""
+        if track.id not in self._lrc:
+            lines: list[tuple[float, str]] = []
+            if track.id not in self._no_lyrics:
+                try:
+                    api = await self._api()
+                    lyrics = await self._retry(lambda: api.tracks_lyrics(track.id, format_="LRC"))
+                    if lyrics is not None:
+                        lines = parse_lrc(await self._retry(lyrics.fetch_lyrics_async))
+                except Exception as e:
+                    log.info("no timed lyrics for %s: %s", track.label("en"), e)
+            self._lrc[track.id] = lines
+        return self._lrc[track.id]
+
+    async def podcast(self, query: str, limit: int) -> list[Track]:
+        """The latest episodes of the podcast `query`, newest first (Yandex lists podcast albums that way)."""
+        api = await self._api()
+        if not api.token or not query:
+            return []
+        res = await self._retry(lambda: api.search(query, type_="podcast"))
+        albums = [a for a in (res.podcasts.results if res.podcasts else [])
+                  if a.type == "podcast" and a.available is not False]
+        if not albums:
+            return []
+        def match(a) -> float:
+            return score(query, a.title or "", ", ".join(artist.name or "" for artist in a.artists))
+        best = max(albums, key=match)
+        if match(best) < MATCH_THRESHOLD:
+            return []
+        album = await self._retry(lambda: api.albums_with_tracks(best.id))
+        episodes = [t for volume in album.volumes or [] for t in volume if t.available is not False]
+        found = [self._track(t) for t in episodes][:limit]
+        self._no_lyrics.update(t.id for t in found)
+        return found
 
     async def radio(self, query: str, limit: int) -> list[Track]:
         """«радио рок», «спокойное», «для тренировки», «90-х»; «радио» or «моя волна» alone is My Wave."""
@@ -457,9 +534,18 @@ class YandexMusic:
 
     async def resolve(self, track: Track) -> str:
         api = await self._api()
+        # Lyrics ride along with the playback message: the voice service tells sung words from
+        # the user's voice with them. Missing lyrics must never stop the song.
+        lyrics = asyncio.create_task(self.lyrics_text(track)) if not track.lyrics else None
         infos = await self._retry(lambda: api.tracks_download_info(track.id))
         best = max(infos, key=lambda i: (not i.preview, i.bitrate_in_kbps))
-        return await self._retry(best.get_direct_link_async)
+        url = await self._retry(best.get_direct_link_async)
+        if lyrics is not None:
+            try:
+                track.lyrics = await lyrics
+            except Exception:  # lyrics_text swallows its own errors; this is belt and braces
+                log.exception("lyrics failed for %s", track.label("en"))
+        return url
 
 
 class _KeepAliveRequest(Request):
@@ -500,10 +586,16 @@ class Music:
         make = {"local": lambda: LocalLibrary(library), "radio": lambda: Radio(dict(cfg.get("radio", {}))),
                 "navidrome": lambda: Navidrome(dict(cfg["navidrome"])),
                 "yandex": lambda: YandexMusic(dict(cfg["yandex"]), brain.cfg.file(cfg["yandex"]["token_file"]))}
+        books_cfg = cfg.get("books") or {}
+        if books_cfg:  # audiobooks: a provider for Music.play_book only, never part of [music] providers
+            from .books import Books  # music is imported by books, so this import has to wait until now
+            make["books"] = lambda: Books(brain.cfg.file(books_cfg["state_file"]), cfg["yandex"]["token_env"],
+                                          brain.cfg.file(cfg["yandex"]["token_file"]))
         for name in cfg["providers"]:
             if name not in make:
                 log.warning("unknown music provider %r; known: %s", name, ", ".join(make))
         self.providers: list[Provider] = [make[name]() for name in cfg["providers"] if name in make]
+        self.books = make["books"]() if "books" in make else None
         self.queue: list[Track] = []
         self.index = 0
         self.state = "stopped"  # mirrors the voice service: stopped, playing, paused
@@ -512,15 +604,49 @@ class Music:
             raise ValueError(f"[music] after_request must be ask, continue or stop, not {self.after_request!r}")
         self.requested = False  # the queue is songs the user named: when they run out, after_request decides
         self.lang = "ru"  # of the request that started the queue, for «Включить мою волну?»
+        self.repeat = False  # play the current track again when it ends, until told otherwise
+        self.announce = bool(cfg.get("announce", False))  # say «Дальше: …» before each next track
         self._playing: tuple[Track, float] | None = None  # the started track and when, for feedback
+        self._progress: tuple[str, float, float] | None = None  # track id, seconds, when that was true
         self._feedback_tasks: set[asyncio.Task] = set()
 
     @property
     def current(self) -> Track | None:
         return self.queue[self.index] if self.state != "stopped" and self.index < len(self.queue) else None
 
+    @property
+    def position(self) -> float:
+        """Seconds into the current track (0.0 when unknown), tracked between voice reports."""
+        if self._progress is None:
+            return 0.0
+        _, seconds, at = self._progress
+        return seconds + (time.monotonic() - at) if self.state == "playing" else seconds
+
     def _provider(self, name: str) -> Provider:
+        if name == "books" and self.books is not None:  # chapters resolve through the book provider
+            return self.books
         return next(p for p in self.providers if p.name == name)
+
+    def _save_book_position(self) -> None:
+        """Write down where the current chapter is before pausing, stopping or replacing it."""
+        cur = self.current
+        if cur is None or cur.provider != "books" or self.books is None:
+            return
+        uuid, _, chapter = cur.id.rpartition(":")
+        if uuid and chapter.isdigit():
+            self.books.remember(uuid, int(chapter), self.position, cur.album)
+
+    async def on_position(self, track_id: str, provider: str, position: float) -> None:
+        """From the voice service: how many seconds of the track played, counted from its start."""
+        cur = self.current
+        if cur is None or cur.id != track_id:
+            return  # a late report from a track that was already replaced
+        position = max(0.0, float(position))
+        self._progress = (track_id, position, time.monotonic())
+        if provider == "books" and self.books is not None:
+            uuid, _, chapter = track_id.rpartition(":")
+            if uuid and chapter.isdigit():
+                self.books.remember(uuid, int(chapter), position, cur.album)
 
     async def find(self, query: str, radio: bool = False) -> list[Track]:
         """Tracks from the first provider, in config order, that has any."""
@@ -572,6 +698,25 @@ class Music:
         self.lang = lang
         return await self._replace_queue(tracks, requested=bool(query) and not radio and not tracks[0].station)
 
+    async def play_book(self, query: str = "", lang: str = "ru", resume: bool = False) -> Track | None:
+        """Start an audiobook at the chapter and second it was left at (or at the start)."""
+        if self.books is None:
+            return None
+        self.lang = lang
+        try:
+            tracks = await (self.books.resume_tracks() if resume and not query else self.books.search(query))
+        except Exception:
+            log.exception("book search failed")
+            return None
+        if not tracks:
+            return None
+        uuid = tracks[0].id.rpartition(":")[0]
+        chapter, position = self.books.saved(uuid)
+        if not 0 <= chapter < len(tracks):
+            chapter, position = 0, 0.0
+        tracks[chapter].start = position
+        return await self._replace_queue(tracks, requested=True, index=chapter)
+
     async def keep_playing(self) -> Track | None:
         """The user said yes to «Включить мою волну?» after the songs they asked for ended."""
         if self.state != "stopped" or not self.queue:
@@ -592,9 +737,83 @@ class Music:
             return None
         return await self._replace_queue(tracks) if tracks else None
 
-    async def _replace_queue(self, tracks: list[Track], requested: bool = False) -> Track | None:
+    async def play_podcast(self, query: str, lang: str = "ru") -> Track | None:
+        """The latest episodes of the named podcast, newest first (Yandex Music only)."""
+        service = next((p for p in self.providers if getattr(p, "podcast", None) is not None), None)
+        if service is None:
+            return None
+        self.lang = lang
+        try:
+            tracks = await service.podcast(query, 20)
+        except Exception:
+            log.exception("podcast search failed")
+            return None
+        return await self._replace_queue(tracks, requested=True) if tracks else None
+
+    async def like(self) -> bool:
+        """Like the current track (Yandex Music; a wave also learns from it). False if it didn't work."""
+        cur = self.current
+        send = getattr(self._provider(cur.provider), "like", None) if cur else None
+        if send is None:
+            return False
+        try:
+            await send(cur)
+        except Exception:
+            log.exception("could not like %s", cur.label("en"))
+            return False
+        self._feedback(cur, "like")
+        return True
+
+    async def dislike(self) -> bool:
+        """Dislike the current track and skip it, like Yandex Station does."""
+        cur = self.current
+        send = getattr(self._provider(cur.provider), "dislike", None) if cur else None
+        if send is None:
+            return False
+        try:
+            await send(cur)
+        except Exception:
+            log.exception("could not dislike %s", cur.label("en"))
+            return False
+        seconds = time.monotonic() - self._playing[1] if self._playing and self._playing[0] is cur else 0.0
+        self._feedback(cur, "dislike", seconds)
+        await self.control("next")
+        return True
+
+    def shuffle(self) -> None:
+        """Shuffle what is left of the queue, keeping the track that is playing where it is."""
+        rest = self.queue[self.index + 1:]
+        random.shuffle(rest)
+        self.queue[self.index + 1:] = rest
+
+    async def lyric_lines(self) -> list[str] | None:
+        """What to read out: the current line (and the next) when the timed lyrics and the playback
+        position put us there, else the opening lines. None when the track has no lyrics."""
+        cur = self.current
+        if cur is None:
+            return None
+        timed = getattr(self._provider(cur.provider), "timed_lyrics", None)
+        if timed is not None:
+            try:
+                lines = await timed(cur)
+            except Exception:
+                log.exception("no lyrics for %s", cur.label("en"))
+                lines = []
+            if lines:
+                position = float(getattr(self, "position", 0.0) or 0.0) - getattr(cur, "start", 0.0)
+                if position > 0:
+                    here = max((i for i, (at, _) in enumerate(lines) if at <= position), default=0)
+                    return [text for _, text in lines[here:here + 2]]
+                return [text for _, text in lines[:4]]
+        text = (cur.lyrics or "").strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines[:4] or None
+
+    async def _replace_queue(self, tracks: list[Track], requested: bool = False, index: int = 0) -> Track | None:
+        self._save_book_position()  # the chapter being replaced keeps its place
         self._report(None)
-        self.queue, self.index, self.requested = tracks, 0, requested
+        self.queue, self.index, self.requested = tracks, max(0, min(index, len(tracks) - 1)) if tracks else 0, requested
+        self.repeat = False  # a new request ends «повтори этот трек»
         return self.current if await self._send_current() else None
 
     async def _offer_more(self) -> None:
@@ -605,8 +824,9 @@ class Music:
             question = "Включить ещё музыку?" if ru else "Shall I play more music?"
         await self.brain.offer("music", question, self.lang)
 
-    async def _send_current(self) -> bool:
-        """Start queue[index], skipping tracks the service won't hand out (False: none left)."""
+    async def _send_current(self, announce: bool = False) -> bool:
+        """Start queue[index], skipping tracks the service won't hand out (False: none left).
+        With `announce`, DJ mode says «Дальше: …» first; the voice service starts the song after it."""
         while self.index < len(self.queue):
             track = self.queue[self.index]
             try:
@@ -617,7 +837,17 @@ class Music:
                 continue
             self.state = "playing"
             log.info("play %s (%d/%d)", track.label("en"), self.index + 1, len(self.queue))
+            if announce and self.announce and not track.live and track.provider != "books":
+                ru = self.lang == "ru"
+                await self.brain.speak(f"Дальше: {track.label('ru')}." if ru else f"Next: {track.label('en')}.",
+                                       self.lang, queue=False)
             await self.brain.broadcast({"type": "music", "action": "play", "track": asdict(track)})
+            self._progress = (track.id, track.start, time.monotonic())
+            if track.provider == "books" and self.books is not None:
+                uuid, _, chapter = track.id.rpartition(":")
+                if uuid and chapter.isdigit():
+                    self.books.remember(uuid, int(chapter), track.start, track.album)
+                track.start = 0.0  # only this play seeks; «следующая»/replay start over
             self._playing = (track, time.monotonic())
             self._feedback(track, "started")
             return True
@@ -651,9 +881,11 @@ class Music:
         if not self.queue or self.state == "stopped" and action != "resume":
             return False
         if action in ("next", "previous"):
+            self.repeat = False  # moving on by hand ends «повтори этот трек»
+            self._save_book_position()  # the chapter we leave keeps its place
             step = 1 if action == "next" else -1
             cur = self.queue[self.index]
-            if step == 1 and self.index + 1 == len(self.queue) and not cur.live:
+            if step == 1 and self.index + 1 == len(self.queue) and not cur.live and cur.provider != "books":
                 # Skipping the last song: past requested songs comes My Wave, past a wave batch the next one.
                 self.queue += await (self._continuation(cur) if self.requested else self._more([cur]))
                 self.requested = False
@@ -661,11 +893,20 @@ class Music:
                 return False
             self._report("skipped")
             self.index += step
-            return await self._send_current()
+            return await self._send_current(announce=step == 1)
         if action == "resume" and self.state == "stopped":
             return await self._send_current()  # replay the last track
         if action == "pause" and self.state != "playing" or action == "resume" and self.state != "paused":
             return False
+        if action == "pause":
+            self._save_book_position()
+            if self._progress is not None:  # freeze the clock while no sound comes out
+                self._progress = (self._progress[0], self.position, time.monotonic())
+        elif action == "stop":
+            self._save_book_position()
+            self._progress = None
+        elif action == "resume" and self._progress is not None:  # clock starts again from the frozen position
+            self._progress = (self._progress[0], self.position, time.monotonic())
         self.state = {"pause": "paused", "resume": "playing", "stop": "stopped"}[action]
         if action == "stop":
             self._report(None)
@@ -680,6 +921,25 @@ class Music:
         if event == "error":
             log.warning("could not play %s: %s", cur.label("en"), detail)
         self._report("finished" if event == "ended" else None)
+        if event == "ended" and self.repeat and not cur.live and cur.provider != "books":
+            await self._send_current()  # «повтори этот трек»: the same track again
+            return
+        if cur.provider == "books" and event in ("ended", "error"):
+            uuid, _, chapter = cur.id.rpartition(":")
+            if self.index + 1 < len(self.queue):  # the bookmark moves on to the next chapter
+                if self.books is not None and uuid and chapter.isdigit():
+                    self.books.remember(uuid, int(chapter) + 1, 0.0, cur.album)
+                self.index += 1
+                await self._send_current()
+            elif event == "ended":  # the book is over: no My Wave, no «Включить ещё музыку?»
+                if self.books is not None and uuid:
+                    self.books.forget_position(uuid, cur.album)
+                self.state, self.requested = "stopped", False
+                await self.brain.speak("Книга закончилась." if self.lang == "ru" else "The book is finished.",
+                                       self.lang, queue=True)
+            else:
+                self.state = "stopped"
+            return
         if event == "ended" and not cur.live and self.index + 1 == len(self.queue):
             if self.requested and self.after_request != "continue":
                 self.state, self.requested = "stopped", False
@@ -691,6 +951,6 @@ class Music:
             self.requested = False
         if event in ("ended", "error") and not cur.live and self.index + 1 < len(self.queue):
             self.index += 1
-            await self._send_current()
+            await self._send_current(announce=True)
         elif event in ("ended", "error"):
             self.state = "stopped"

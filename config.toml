@@ -85,6 +85,11 @@ providers = ["local", "radio"]
 # «да» starts it), "continue" (start it without asking) or "stop". It is My
 # Wave when Yandex Music has a token, otherwise more from the same source.
 after_request = "ask"
+# DJ mode: say «Дальше: <artist — song>» before each next track (not the
+# first one you asked for). «включи режим диджея» and «выключи режим
+# диджея» change it until restart; audiobook chapters and radio are never
+# announced.
+announce = false
 # Music volume while you talk or the speaker answers (fraction of normal).
 duck_volume = 0.2
 # You are talking over the music when the mic is this many times louder than
@@ -98,6 +103,11 @@ navidrome = { url = "http://127.0.0.1:4533", user = "speaker", password_env = "N
 # token_file (owner-only, kept across restarts); $token_env, if set, wins.
 # Full tracks need Yandex Plus; without a token only 30 s previews play.
 yandex = { token_env = "YANDEX_MUSIC_TOKEN", token_file = "state/yandex_token" }
+# Audiobooks from Yandex Books, with the same token. «включи аудиокнигу мастер
+# и маргарита», «продолжи книгу», «следующая глава». The chapter and the second
+# you stopped at are saved here, per book; delete the file to forget them.
+# Books are searched only for these commands, never for «включи музыку».
+books = { state_file = "state/books.json" }
 
 [asr]
 url = "ws://127.0.0.1:8090/v1/audio/transcriptions/realtime"
@@ -175,6 +185,19 @@ timeout = 15
 # When the big model is configured, ask whether it should answer from the
 # search results ("Пусть ответит большая модель?") instead of LFM3.
 offer_big_model = true
+
+[news]
+# RSS feeds for «что нового?» and the morning show. The first headlines of
+# each feed are read in turn; separate lists for Russian and English answers.
+feeds_ru = ["https://lenta.ru/rss/news", "https://ria.ru/export/rss2/archive/index.xml", "https://tass.ru/rss/v2.xml", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss"]
+feeds_en = ["https://feeds.bbci.co.uk/news/rss.xml"]
+# Headlines per answer, and how long they are reused before fetching again.
+items = 5
+cache_minutes = 10
+
+[shopping]
+# The shopping list («добавь молоко в список покупок»), saved as JSON.
+state_file = "state/shopping.json"
 
 [omp]
 # Coding-agent threads you talk to by voice. omp sessions that load

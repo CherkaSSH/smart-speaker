@@ -14,6 +14,7 @@ dependencies = [
     "textual>=8.2.8",
     "tomlkit>=0.15.2",
     "yandex-music>=2.2",
+    "yandex-book-api[async]>=2.0.2",
 ]
 
 [project.scripts]

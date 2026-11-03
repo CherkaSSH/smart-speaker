@@ -23,7 +23,8 @@ USERS = {
     "character": ("brain", "voice"), "wake": ("voice",), "gate": ("voice",), "audio": ("voice", "brain"),
     "music": ("brain", "voice"),
     "asr": ("asr", "voice"), "tts": ("voice",), "llm": ("llm", "brain"), "remote_llm": ("brain",),
-    "omp": ("brain",), "web_search": ("brain",), "memory": ("embed", "brain"), "brain": ("brain",),
+    "omp": ("brain",), "web_search": ("brain",), "news": ("brain",), "shopping": ("brain",),
+    "memory": ("embed", "brain"), "brain": ("brain",),
     "voice": ("voice",),
 }
 CHOICES = {

@@ -12,7 +12,7 @@ import re
 import time
 from typing import TYPE_CHECKING
 
-from . import speech
+from . import books, extras, speech
 from .music import MY_WAVE
 from .numbers import parse_duration, parse_number
 
@@ -70,6 +70,18 @@ def parse_clock(t: str) -> tuple[int, int] | None:
     return hh, mm
 
 
+def alarm_music(t: str) -> str | None:
+    """Music to wake up to: «под Кино» -> "кино", «с музыкой» -> "" (any music), else None."""
+    m = re.search(r"\b(?:под|с)\s+(.+)$", t)
+    if m:
+        tail = m.group(1).strip(" ,.")
+        tail = re.sub(r"^(музыку|музыка|музыкой|music)\b\s*", "", tail).strip(" ,.")
+        if tail in ("утра", "вечера", "дня", "ночи", "утром", "вечером"):
+            return None
+        return tail
+    return "" if _has(t, r"\b(музык\w*|music)\b") else None
+
+
 async def handle(brain: "Brain", text: str, lang: str) -> str | None:
     t = normalize(text)
     words = t.split()
@@ -97,6 +109,11 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
                     return "Куда уж громче, и так на максимуме." if louder else "Тише уже некуда."
                 return "Already at maximum." if louder else "Already at minimum."
             return f"Громкость {speech.ru_number(brain.volume, True)}." if ru else f"Volume {speech.num2words(brain.volume)}."
+
+    # Extras: sleep timer, morning show, news, rates, shopping list -------
+    reply = await extras.handle(brain, t, words, lang, ru)
+    if reply is not None:
+        return reply
 
     # Timers ------------------------------------------------------------
     if _has(t, _TIMER) and _has(t, _CANCEL):
@@ -131,9 +148,15 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
                 when += dt.timedelta(days=days)
             elif when <= now:
                 when += dt.timedelta(days=1)
-            brain.scheduler.add("alarm", when.timestamp(), lang)
+            music = alarm_music(t)
+            brain.scheduler.add("alarm", when.timestamp(), lang, music=music)
             offset = (when.date() - now.date()).days
             day = (["сегодня", "завтра", "послезавтра"] if ru else ["today", "tomorrow", "the day after tomorrow"])[offset]
+            if music is not None:
+                tune = f" Под «{music}»." if music else " С музыкой."
+                if ru:
+                    return f"Будильник на {day}, {speech.clock(hh, mm, 'ru')}." + tune
+                return f"Alarm set for {speech.clock(hh, mm, 'en')} {day}." + tune
             if ru:
                 return f"Будильник на {day}, {speech.clock(hh, mm, 'ru')}."
             return f"Alarm set for {speech.clock(hh, mm, 'en')} {day}."
@@ -146,6 +169,11 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
         if ru:
             return "Осталось " + ", и ".join(left) + "."
         return " and ".join(left) + " left."
+
+    # Audiobooks ---------------------------------------------------------
+    reply = await books.handle(brain, t, words, ru)
+    if reply is not None:
+        return reply
 
     # Music -------------------------------------------------------------
     reply = await _music(brain, t, words, ru)
@@ -171,6 +199,9 @@ _FILLER = r"\b(мне|пожалуйста|please|какую нибудь|как
           r"песню|песня|song|трек|track)\b"
 _DEVICES = r"\b(свет\w*|ламп\w*|телевизор\w*|тв|чайник\w*|кондиционер\w*|отоплени\w*|обогрев\w*|пылесос\w*|" \
            r"розетк\w*|light\w*|lamp\w*|tv|television|kettle|heater|vacuum)\b"
+_LYRICS = r"\b(какие (там )?слова|какой (там )?текст|текст (песни|трека)|слова (песни|трека)|" \
+          r"о чем (поет|поется|песня|трек)|что (там )?поется|lyrics|what are the (words|lyrics)|" \
+          r"what s (it|the song|this song) about|what does it say)\b"
 
 
 async def _music(brain: "Brain", t: str, words: list[str], ru: bool) -> str | None:
@@ -181,6 +212,64 @@ async def _music(brain: "Brain", t: str, words: list[str], ru: bool) -> str | No
 
     async def control(action: str, nothing: tuple[str, str]) -> str:
         return "" if await music.control(action) else nothing[0 if ru else 1]
+
+    if short and _has(t, r"\b(режим\w* )?(диджея|диджей|dj)\b") \
+            and _has(t, r"\b(включ\w*|вруб\w*|включай|on|enable|выключ\w*|отключ\w*|off|disable)\b"):
+        music.announce = not _has(t, _CANCEL)
+        if ru:
+            return "Режим диджея включён." if music.announce else "Режим диджея выключен."
+        return "DJ mode on." if music.announce else "DJ mode off."
+
+    if short and _has(t, r"\b(повтор\w*|repeat\w*)\b"):
+        if _has(t, _CANCEL) or _has(t, r"\b(не повторяй\w*|без повтора|no repeat)\b"):
+            music.repeat = False
+            return "Повтор выключен." if ru else "Repeat off."
+        cur = music.current
+        if cur is None:
+            return "Сейчас ничего не играет." if ru else "Nothing is playing."
+        if cur.live:
+            return "Радио не повторяю." if ru else "I can't repeat a radio stream."
+        music.repeat = True
+        return f"Повторяю {cur.label('ru')}." if ru else f"Repeating {cur.label('en')}."
+
+    if short and _has(t, r"\b(перемешай\w*|перемешать|shuffle\w*)\b"):
+        cur = music.current
+        if cur is None:
+            return "Сейчас ничего не играет." if ru else "Nothing is playing."
+        if cur.live or cur.station:
+            return "В волне перемешивать нечего." if ru else "There's nothing to shuffle in a wave."
+        music.shuffle()
+        return "Перемешал остальное." if ru else "Shuffled the rest."
+
+    dislike = short and (_has(t, r"\b(дизлайк\w*|dislike\w*)\b") or _has(t, r"\bне (нравится|понравил\w*)\b")
+                         or _has(t, r"\b(don t|do not) like\b"))
+    like = short and not dislike and not _has(t, r"\b(что|чем|какие|какой|какая|what|which|do you)\b") \
+        and (_has(t, r"\bлайк\w*\b") or _has(t, r"\bнравится\b") or _has(t, r"\bi like (it|this|that|the song)\b"))
+    if like or dislike:
+        cur = music.current
+        if cur is None:
+            return "Сейчас ничего не играет." if ru else "Nothing is playing."
+        if cur.provider != "yandex":
+            return "Лайки работают только в Яндекс Музыке." if ru else "Likes only work with Yandex Music."
+        if dislike:
+            if not await music.dislike():
+                return "Не получилось." if ru else "That didn't work."
+            return "Не нравится — пропускаю." if ru else "Disliked; skipping."
+        if not await music.like():
+            return "Не получилось." if ru else "That didn't work."
+        return "Поставила лайк." if ru else "Liked."
+
+    if _has(t, _LYRICS):
+        cur = music.current
+        if cur is None:
+            return "Сейчас ничего не играет." if ru else "Nothing is playing."
+        lines = await music.lyric_lines()
+        if not lines:
+            return "У этого трека нет текста." if ru else "This track has no lyrics."
+        spoken = " ".join(lines)
+        if len(spoken) > 260:
+            spoken = spoken[:260].rsplit(" ", 1)[0] + "…"
+        return f"Вот: «{spoken}»" if ru else f"Here: “{spoken}”"
 
     if short and _has(t, r"\b(пауз\w*|pause)\b"):
         return await control("pause", ("Ничего не играет.", "Nothing is playing."))
@@ -218,6 +307,15 @@ async def _music(brain: "Brain", t: str, words: list[str], ru: bool) -> str | No
         if not brain.clients:
             return "Голосовой модуль не подключён." if ru else "The voice service is not connected."
         lang = "ru" if ru else "en"
+        if _has(rest, r"\b(подкаст\w*|podcast\w*)\b"):
+            name = re.sub(r"\b(подкаст\w*|podcast\w*)\b", " ", query).strip()
+            if not name:
+                return "Какой подкаст включить?" if ru else "Which podcast?"
+            track = await music.play_podcast(name, lang)
+            if track is None:
+                return f"Не нашёл подкаст «{name}»." if ru else f"I couldn't find the podcast {name}."
+            return (f"Включаю подкаст «{track.album}», с последнего выпуска." if ru
+                    else f"Playing the podcast “{track.album}”, latest episode first.")
         if radio:
             track = await music.play(station, True, lang)
         elif query and _has(m.group(2), r"\b(музык\w*|music)\b"):  # «спокойную музыку»: a wave, else a search

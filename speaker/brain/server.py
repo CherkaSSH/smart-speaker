@@ -5,6 +5,8 @@ Protocol (JSON text frames):
                   {"type": "utterance", "id": str, "text": str, "lang": "ru"|"en"}
                   {"type": "cancel"}            stop the current answer (barge-in, "стоп")
                   {"type": "listening", "id": str}   a follow-up window opened after turn or speak `id`
+                  {"type": "music_position", "id": str, "provider": str, "position": float}
+                                                seconds into the current track (books resume, lyrics)
   brain -> voice  {"type": "volume", "level": 0..10}
                   {"type": "say", "id": str, "text": str, "lang": str}
                   {"type": "turn_end", "id": str, "expect_reply": bool}
@@ -42,6 +44,9 @@ from .escalate import RemoteLLM
 from .llm import LLM
 from .memory import Memory
 from .music import MY_WAVE, Music, asks_for_music
+from .news import News
+from .rates import Rates
+from .shopping import Shopping
 from .timers import Item, Scheduler
 from .tools import BIG_MODEL_SCHEMA, SCHEMAS, WEB_SEARCH_SCHEMA, Tools
 from .text import SentenceSplitter
@@ -109,6 +114,7 @@ You are the voice of a home smart speaker, like Yandex Station's Alice. Everythi
 - When ask_big_model is available, use it for requests beyond your reasoning or knowledge ability; the user is asked to confirm first.
 - For current events, news, prices, schedules or anything else Wikipedia wouldn't have, call web_search with an English objective and English queries, then answer from the results in the reply language.
 - Each user message starts with the current date, time and reply language in square brackets. Don't mention the date or time unless asked.
+- Translate short phrases directly: for «как по-английски …», «переведи на …», «как будет … по-немецки» say only the translation in one short sentence, without defining or explaining the word and without tools.
 - Use play_music only when the user asks to play music: a song, an artist, "some music" or a radio station. Stories, fairy tales and poems you tell yourself. music_control pauses, resumes, skips (next, previous) or stops it.
 - You can't control other devices (lights, TV); say so briefly if asked.
 """
@@ -147,6 +153,9 @@ class Brain:
         self.agents = Agents(self, cfg["omp"], f"ws://{host}:{b['port']}/omp")
         self.web = WebSearch(cfg["web_search"])
         self.music = Music(self, cfg["music"], cfg.file(cfg["music"]["library"]))
+        self.news = News(cfg["news"])
+        self.rates = Rates()
+        self.shopping = Shopping(cfg.file(cfg["shopping"]["state_file"]))
         self.confirm_big = bool(r["confirm"])
         self.offer_big_for_search = bool(cfg["web_search"]["offer_big_model"])
         self.schemas = SCHEMAS + ([WEB_SEARCH_SCHEMA] if self.web.enabled else []) \
@@ -189,6 +198,10 @@ class Brain:
 
     async def _fire(self, item: Item) -> None:
         ru = item.lang == "ru"
+        if item.kind == "sleep":
+            log.info("sleep timer: stopping the music")
+            await self.music.control("stop")
+            return
         if item.label:
             text = f"Напоминаю: {item.label}." if ru else f"Reminder: {item.label}."
         elif item.kind == "alarm":
@@ -196,6 +209,13 @@ class Brain:
         else:
             text = f"Таймер на {speech.duration(item.seconds, 'ru', accusative=True)} всё." if ru else \
                 f"Your {speech.duration(item.seconds, 'en')} timer is done."
+        if item.kind == "alarm" and item.music is not None:
+            # The music is the alarm: a short line (which the voice finishes first), then the songs.
+            log.info("alarm with music %r: %s", item.music, text)
+            await self.speak(text, item.lang, queue=True)
+            if self.clients:
+                await self.music.play(item.music, False, item.lang)
+            return
         log.info("ring: %s", text)
         await self.broadcast({"type": "ring", "text": text, "lang": item.lang})
 
@@ -429,6 +449,8 @@ class Brain:
                     self.cancel_turn()
                 elif kind == "music_event":
                     await self.music.on_event(d["event"], d["id"], d.get("detail", ""))
+                elif kind == "music_position":
+                    await self.music.on_position(d["id"], d.get("provider", ""), float(d.get("position") or 0.0))
                 elif kind == "listening":
                     self._listening(d.get("id", ""))
         finally:

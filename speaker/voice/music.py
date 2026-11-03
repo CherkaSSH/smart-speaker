@@ -31,8 +31,10 @@ DUCK_RAMP = 0.15  # seconds to fade between full and ducked volume
 
 class MusicPlayer:
     def __init__(self, audio_cfg: dict, music_cfg: dict, loop: asyncio.AbstractEventLoop,
-                 on_event: Callable[[str, dict, str], Awaitable[None]], reference=None):
+                 on_event: Callable[[str, dict, str], Awaitable[None]], reference=None,
+                 on_position: Callable[[dict, float], Awaitable[None]] | None = None):
         self.reference = reference  # what we play, for echo cancellation
+        self._on_position = on_position  # seconds into the current track, for resume and lyrics
         self.rate = int(audio_cfg["sample_rate"])
         self.device = find_device(audio_cfg["output_device"], "output")
         self.channels = min(2, int(sd.query_devices(self.device, "output")["max_output_channels"]))
@@ -52,20 +54,37 @@ class MusicPlayer:
         self._error = ""
         self._stream: sd.OutputStream | None = None
         self._generation = 0  # ignores callbacks from a replaced track
+        self._seek = 0.0  # where this track started (track["start"]), in seconds
+        self._played = 0  # frames actually sent to the sound card since then
+        self._progress_task: asyncio.Task | None = None
+
+    @property
+    def position(self) -> float:
+        """Seconds into the source, counting from the seek offset: what the ear has heard."""
+        return self._seek + self._played / self.rate
 
     # Control ---------------------------------------------------------------
     def play(self, track: dict) -> None:
+        self._stop_progress()
+        if self.track is not None:
+            self._report_position()  # the chapter being replaced keeps its place
         self.stop(report=False)
         self.track = track
+        self._seek = float(track.get("start") or 0.0)
+        self._played = 0
         self.lyric_words = {phonetic(w) for w in words(track.get("lyrics") or "")}
         self._start_decoder()
         self.state = "playing"
         self._open()
-        log.info("playing %s — %s", track.get("artist") or "?", track.get("title") or track.get("source"))
+        self._start_progress()
+        log.info("playing %s — %s%s", track.get("artist") or "?", track.get("title") or track.get("source"),
+                 f" from {self._seek:.0f}s" if self._seek else "")
 
     def pause(self) -> None:
         if self.state == "playing":
+            self._report_position()
             self.state = "paused"
+            self._stop_progress()
             self._close()  # the device idles; ffmpeg stalls on its full pipe
             log.info("paused")
 
@@ -76,11 +95,15 @@ class MusicPlayer:
             self._start_decoder()
         self.state = "playing"
         self._open()
+        self._start_progress()
         log.info("resumed")
 
     def stop(self, report: bool = True) -> None:
         if self.state == "stopped":
             return
+        if report:
+            self._report_position()
+        self._stop_progress()
         self._close()
         self._kill_decoder()
         self.state = "stopped"
@@ -98,14 +121,40 @@ class MusicPlayer:
         vals = [rms for t, rms in list(self.levels) if start <= t <= end]
         return float(np.mean(vals)) if vals and self.state == "playing" else None
 
+    # Position --------------------------------------------------------------
+    def _report_position(self) -> None:
+        """Tell the brain how far in we are: pausing or replacing a book chapter saves it."""
+        if self._on_position is None or self.track is None or not (self._seek or self._played):
+            return
+        asyncio.ensure_future(self._on_position(self.track, self.position))
+
+    def _start_progress(self) -> None:
+        self._stop_progress()
+        if self._on_position is not None:
+            self._progress_task = self._loop.create_task(self._progress())
+
+    def _stop_progress(self) -> None:
+        if self._progress_task is not None:
+            self._progress_task.cancel()
+            self._progress_task = None
+
+    async def _progress(self) -> None:
+        """A coarse report while playing, so a crash or power cut loses at most this much."""
+        while self.state == "playing":
+            await asyncio.sleep(30)
+            if self.state != "playing":
+                return
+            self._report_position()
+
     # Decoding --------------------------------------------------------------
     def _start_decoder(self) -> None:
         self._kill_decoder()
         src = self.track["source"]
         net = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] \
             if "://" in src else []
+        seek = ["-ss", f"{self._seek:.3f}"] if self._seek > 0 else []  # before -i: fast for HLS too
         self._proc = subprocess.Popen(
-            ["ffmpeg", "-nostdin", "-loglevel", "error", *net, "-i", src, "-vn", "-f", "f32le",
+            ["ffmpeg", "-nostdin", "-loglevel", "error", *net, *seek, "-i", src, "-vn", "-f", "f32le",
              "-ac", "2", "-ar", str(self.rate), "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
         self._chunks = queue.Queue(maxsize=BUFFER_CHUNKS)
@@ -172,6 +221,7 @@ class MusicPlayer:
         block = np.zeros((frames, 2), np.float32)
         block[:n] = buf[:n]
         self._rest = buf[n:]
+        self._played += n  # what the ear has actually received; the decoded buffer runs ahead
         # Ramp toward the duck target within the block (no clicks).
         step = 1.0 / max(1.0, DUCK_RAMP * self.rate)
         target = self._duck_target
@@ -194,6 +244,7 @@ class MusicPlayer:
             return
         self._close()
         self._kill_decoder()
+        self._stop_progress()
         self.state = "stopped"
         self._report("error" if self._error else "ended", self._error)
 
@@ -202,5 +253,6 @@ class MusicPlayer:
             asyncio.ensure_future(self._on_event(event, self.track, detail))
 
     def close(self) -> None:
+        self._stop_progress()
         self._close()
         self._kill_decoder()

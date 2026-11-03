@@ -12,11 +12,12 @@ from typing import Awaitable, Callable
 @dataclass
 class Item:
     id: int
-    kind: str  # "timer" | "alarm"
+    kind: str  # "timer" | "alarm" | "sleep"
     due: float  # epoch seconds
     lang: str
     label: str = ""
     seconds: int = 0  # original length, timers only
+    music: str | None = None  # alarm: what to play after the wake-up line ("" = any music); None = ring only
 
     def remaining(self, now: float | None = None) -> int:
         return max(0, int(round(self.due - (now or time.time()))))
@@ -42,8 +43,9 @@ class Scheduler:
         self._wake.set()
 
     # API ---------------------------------------------------------------
-    def add(self, kind: str, due: float, lang: str, label: str = "", seconds: int = 0) -> Item:
-        item = Item(next(self._ids), kind, due, lang, label.strip(), seconds)
+    def add(self, kind: str, due: float, lang: str, label: str = "", seconds: int = 0,
+            music: str | None = None) -> Item:
+        item = Item(next(self._ids), kind, due, lang, label.strip(), seconds, music)
         self.items[item.id] = item
         self._changed()
         return item

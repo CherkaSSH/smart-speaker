@@ -59,7 +59,8 @@ class Voice:
         # One record of everything we play, so the mic can subtract it (echo cancellation).
         self.reference = Reference() if cfg["audio"]["echo_cancellation"] else None
         self.player = Player(cfg["audio"], loop, self.reference)
-        self.music = MusicPlayer(cfg["audio"], cfg["music"], loop, self.on_music_event, self.reference)
+        self.music = MusicPlayer(cfg["audio"], cfg["music"], loop, self.on_music_event, self.reference,
+                                 on_position=self.on_music_position)
         self.talk_until = 0.0  # the user is talking over the music until then: keep it ducked
         self._music_start: asyncio.Task | None = None
         a = cfg["asr"]
@@ -405,6 +406,11 @@ class Voice:
     async def on_music_event(self, event: str, track: dict, detail: str) -> None:
         log.info("music %s: %s %s", event, track.get("title"), detail[:120])
         await self.send({"type": "music_event", "event": event, "id": track["id"], "detail": detail})
+
+    async def on_music_position(self, track: dict, position: float) -> None:
+        """How far into the track the sound card has got: the brain saves it for books and lyrics."""
+        await self.send({"type": "music_position", "id": track["id"], "provider": track.get("provider", ""),
+                         "position": round(float(position), 1)})
 
     async def speaker(self) -> None:
         """Synthesize answer sentences in order, ahead of playback."""
