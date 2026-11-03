@@ -133,7 +133,7 @@ def main() -> None:
         edit_settings(cfg.path)
     elif args.cmd == "yandex-login":
         from .brain.music import yandex_login
-        asyncio.run(yandex_login(cfg["music"]["yandex"]["token_env"]))
+        asyncio.run(yandex_login(cfg.file(cfg["music"]["yandex"]["token_file"])))
     elif args.cmd == "up":
         asyncio.run(up(cfg, args))
     elif args.cmd == "ask":

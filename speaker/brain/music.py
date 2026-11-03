@@ -314,8 +314,9 @@ class YandexMusic:
 
     name = "yandex"
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, token_file: Path):
         self.token_env = cfg["token_env"]
+        self.token_file = token_file
         self._client = None
         self._stations: dict[str, tuple[str, str, int]] = {}  # name -> (rotor id, English tag, type order)
         self._seeded: dict[str, str] = {}  # «по треку …» -> rotor id: waves started from a song, not searchable
@@ -323,15 +324,20 @@ class YandexMusic:
         self._batches: dict[str, tuple[str, str]] = {}  # track id -> (rotor id, batch id), for feedback
 
     @property
+    def token(self) -> str:
+        return yandex_token(self.token_env, self.token_file)
+
+    @property
     def has_waves(self) -> bool:
         """Waves (My Wave too) need a signed-in account."""
-        return bool(os.environ.get(self.token_env))
+        return bool(self.token)
 
     async def _api(self):
         if self._client is None:
-            token = os.environ.get(self.token_env)
+            token = self.token
             if not token:
-                log.warning("$%s is not set: Yandex Music plays 30-second previews", self.token_env)
+                log.warning("no Yandex token ($%s or %s): Yandex Music plays 30-second previews",
+                            self.token_env, self.token_file)
             client = ClientAsync(token or None, request=_KeepAliveRequest())
             self._client = await self._retry(client.init)
         return self._client
@@ -468,11 +474,23 @@ class _KeepAliveRequest(Request):
         return {**super()._prepare_kwargs(kwargs), "connector": self._connector}
 
 
-async def yandex_login(token_env: str) -> None:
-    """OAuth device flow: enter a code on Yandex's page and get a token for $token_env."""
+def yandex_token(env: str, file: Path) -> str:
+    """The Yandex OAuth token: $env if set, else the file `speaker yandex-login` saved it to."""
+    token = os.environ.get(env, "").strip()
+    if not token and file.exists():
+        token = file.read_text().strip()
+    return token
+
+
+async def yandex_login(token_file: Path) -> None:
+    """OAuth device flow: enter a code on Yandex's page; the token is saved to `token_file` (owner-only)."""
     token = await ClientAsync().device_auth(
         on_code=lambda c: print(f"Open {c.verification_url} and enter the code {c.user_code}", flush=True))
-    print(f"export {token_env}={token.access_token}")
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.touch(mode=0o600)
+    token_file.chmod(0o600)
+    token_file.write_text(token.access_token + "\n")
+    print(f"Saved the token to {token_file}")
 
 
 # Controller -----------------------------------------------------------------------
@@ -480,7 +498,8 @@ class Music:
     def __init__(self, brain: "Brain", cfg: dict, library: Path):
         self.brain = brain
         make = {"local": lambda: LocalLibrary(library), "radio": lambda: Radio(dict(cfg.get("radio", {}))),
-                "navidrome": lambda: Navidrome(dict(cfg["navidrome"])), "yandex": lambda: YandexMusic(dict(cfg["yandex"]))}
+                "navidrome": lambda: Navidrome(dict(cfg["navidrome"])),
+                "yandex": lambda: YandexMusic(dict(cfg["yandex"]), brain.cfg.file(cfg["yandex"]["token_file"]))}
         for name in cfg["providers"]:
             if name not in make:
                 log.warning("unknown music provider %r; known: %s", name, ", ".join(make))

@@ -94,9 +94,10 @@ radio = { "Groove Salad" = "https://ice1.somafm.com/groovesalad-128-mp3", "Secre
 # A Navidrome (or other Subsonic) server; the password is read from the
 # environment variable named here.
 navidrome = { url = "http://127.0.0.1:4533", user = "speaker", password_env = "NAVIDROME_PASSWORD" }
-# Yandex Music: get a token with `speaker yandex-login` and export it under this
-# name. Full tracks need Yandex Plus; without a token only 30 s previews play.
-yandex = { token_env = "YANDEX_MUSIC_TOKEN" }
+# Yandex Music: `speaker yandex-login` signs in and saves the token to
+# token_file (owner-only, kept across restarts); $token_env, if set, wins.
+# Full tracks need Yandex Plus; without a token only 30 s previews play.
+yandex = { token_env = "YANDEX_MUSIC_TOKEN", token_file = "state/yandex_token" }
 
 [asr]
 url = "ws://127.0.0.1:8090/v1/audio/transcriptions/realtime"
