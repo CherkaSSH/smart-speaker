@@ -6,8 +6,11 @@ Every omp session that loads omp/speaker.ts connects to the brain's /omp WebSock
 it running; it shows in your Tern window) and gives it the task. Only main sessions connect:
 subagents, advisors and print-mode runs never become threads.
 Threads are numbered from one, in the order they connect, so they can be named by voice:
-«скажи второму агенту …», «спроси агента три …». Without a number the request goes to
-the thread you last talked with, or to the only one.
+«скажи второму агенту …», «спроси агента три …»; or by name: the tag of the session's title
+(«агенту алекса» for "ALEXA: …") or its folder. Without either, the request goes to the thread
+you last talked with, or to the only one. A thread that has closed is reopened (omp --resume in
+a new Tern tab) and gets the request once it connects; named ones are found among omp's
+session files, so any past session can be picked up again.
 
 Agents talk back with their speaker_say / speaker_ask tools; those, side-question
 answers and "finished" notices are said as soon as the speaker is free.
@@ -28,6 +31,7 @@ from aiohttp import WSMsgType, web
 
 from ..lang import ru_plural
 from . import speech
+from .music import score
 from .text import clean
 
 if TYPE_CHECKING:
@@ -37,6 +41,7 @@ log = logging.getLogger("brain.agents")
 
 START_TIMEOUT = 60  # seconds for a new thread to start and connect
 DONE_CHARS = 300  # how much of a final answer is read out when the agent didn't speak itself
+NAME_MATCH = 0.85  # how closely spoken words must match a session's name (music's fuzzy score)
 
 _ORDINAL_STEMS = {"перв": 1, "втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6, "седьм": 7, "восьм": 8, "девят": 9}
 _NUMBERS = {"один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
@@ -106,11 +111,37 @@ def _short(text: str, limit: int = DONE_CHARS) -> str:
     return cut[:end + 1] if end > 0 else cut.rsplit(" ", 1)[0] + "…"
 
 
+_ICONS = re.compile(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]")  # omp puts a nerd-font icon before titles
+
+
+def _names(title: str, cwd: str) -> list[str]:
+    """What a session can be called by voice: its title's tag («ALEXA» in "ALEXA: Connect threads…") and its folder."""
+    names = []
+    tag = re.match(r"\s*([^\W_]+)\s*:", _ICONS.sub("", title))
+    if tag:
+        names.append(tag[1])
+    folder = Path(cwd).name.replace("-", " ").replace("_", " ")
+    if folder:
+        names.append(folder)
+    return names
+
+
+@dataclass
+class Saved:
+    """A session that isn't connected (closed, or open in an omp without this extension): enough to reopen it."""
+    session: str
+    file: str
+    cwd: str
+    name: str
+    mtime: float = 0.0
+
+
 @dataclass
 class Thread:
     ws: web.WebSocketResponse
     number: int
     session: str = ""
+    file: str = ""
     name: str = ""
     cwd: str = ""
     busy: bool = False
@@ -119,9 +150,26 @@ class Thread:
 
     @property
     def title(self) -> str:
-        """The session's title (omp prefixes it with an icon from a private-use font), else its folder."""
-        name = re.sub(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]", "", self.name).strip()
-        return (name or Path(self.cwd).name or "omp")[:60]
+        """The session's title, else its folder."""
+        return (_ICONS.sub("", self.name).strip() or Path(self.cwd).name or "omp")[:60]
+
+
+def saved_sessions(root: Path) -> list[Saved]:
+    """Every omp session on disk, newest first. A session file starts with its title record and header."""
+    out = []
+    for f in root.glob("*/*.jsonl"):
+        try:
+            with f.open(encoding="utf-8") as fh:
+                head = [json.loads(line) for line, _ in zip(fh, range(3)) if line.strip()]
+            mtime = f.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        header = next((r for r in head if r.get("type") == "session"), None)
+        if header is None:
+            continue
+        title = next((r.get("title", "") for r in head if r.get("type") == "title"), header.get("title", ""))
+        out.append(Saved(header.get("id", ""), str(f), header.get("cwd", ""), title or "", mtime))
+    return sorted(out, key=lambda s: s.mtime, reverse=True)
 
 
 class Agents:
@@ -131,10 +179,11 @@ class Agents:
         self.cwd = brain.cfg.file(cfg["cwd"])
         self.command = list(cfg["command"])
         self.session = cfg["tern_session"]  # the Tern session new threads open in, as tabs
+        self.sessions = brain.cfg.file(cfg["sessions"])  # omp's session files, to reopen closed threads
         self.url = url  # where the threads we start connect back to
         self.threads: list[Thread] = []
-        self.focus: Thread | None = None
-        self.starting: dict[str, tuple[int, str, str]] = {}  # token -> (number, task, lang)
+        self.focus: Thread | Saved | None = None  # the thread last talked with; Saved once it closed
+        self.starting: dict[str, tuple[int, dict, str]] = {}  # token -> (number, first message, lang)
         self._tasks: set[asyncio.Task] = set()
 
     # Voice commands ------------------------------------------------------
@@ -157,40 +206,76 @@ class Agents:
                 self.brain.pending = self.brain.expect_reply(lang, task)
                 return "Что сделать агенту?" if ru else "What should the agent do?"
             return await self.start(rest, lang)
-        if not self.threads:
-            return "Агентов нет." if ru else "There are no agents."
-        thread = self._pick(n)
-        if thread is None:
-            if n is None:
-                return "Агентов несколько: назовите номер." if ru else "There are several agents: say a number."
-            return f"Агента номер {speech.ru_number(n)} нет." if ru else f"There is no agent {n}."
-        thread.lang, self.focus = lang, thread
+        target, rest = self._target(n, rest)
+        if target is None:
+            if n is not None:
+                return f"Агента номер {speech.ru_number(n)} нет." if ru else f"There is no agent {n}."
+            if not self.threads:
+                return "Открытых агентов нет: назовите агента по имени." if ru else "No agents are open: name one."
+            return "Агентов несколько: назовите номер или имя." if ru else \
+                "There are several agents: say a number or a name."
+        if isinstance(target, Thread):
+            target.lang = lang
+        self.focus = target
         if rest:
-            return await self._deliver(thread, kind, rest)
+            return await self._deliver(target, kind, rest, lang)
 
         async def deliver(answer: str | None) -> str | None:
-            return await self._deliver(thread, kind, answer) if answer else None
+            return await self._deliver(target, kind, answer, lang) if answer else None
         self.brain.pending = self.brain.expect_reply(lang, deliver)
         if kind == "tell":
             return "Что передать?" if ru else "What should I pass along?"
         return "Что спросить?" if ru else "What should I ask?"
 
-    async def _deliver(self, t: Thread, kind: str, text: str) -> str:
-        """Pass what the user said to a thread: as a message ("tell") or a side question ("ask")."""
-        ru = t.lang == "ru"
+    async def _deliver(self, t: Thread | Saved, kind: str, text: str, lang: str) -> str:
+        """Pass what the user said to a thread: as a message ("tell") or a side question ("ask").
+        A closed thread is reopened first and gets it once it connects."""
+        ru = lang == "ru"
+        msg = {"type": "prompt", "text": text} if kind == "tell" else \
+            {"type": "btw", "id": uuid.uuid4().hex[:8], "text": text}
+        if isinstance(t, Thread):
+            await self._send(t, msg)
+            if kind == "tell":
+                return "Передаю." if ru else "Passing it on."
+            return "Спрашиваю." if ru else "Asking."
+        cwd = t.cwd if Path(t.cwd).is_dir() else str(self.cwd)
+        if await self._launch(cwd, [*self.command, "--resume", t.file], msg, lang) is None:
+            return "Не получилось открыть агента." if ru else "I couldn't reopen the agent."
+        log.info("reopening %s (%s)", t.session, t.name)
         if kind == "tell":
-            await self._send(t, {"type": "prompt", "text": text})
-            return "Передаю." if ru else "Passing it on."
-        await self._send(t, {"type": "btw", "id": uuid.uuid4().hex[:8], "text": text})
-        return "Спрашиваю." if ru else "Asking."
+            return "Открываю агента и передаю." if ru else "Reopening the agent and passing it on."
+        return "Открываю агента и спрашиваю." if ru else "Reopening the agent and asking."
 
-    def _pick(self, n: int | None) -> Thread | None:
-        """Thread number `n`; without a number, the one last talked with or the only one."""
+    def _target(self, n: int | None, rest: str) -> tuple[Thread | Saved | None, str]:
+        """Who a request is for, and the request without the name that picked it: thread number `n`;
+        a thread named at the start of `rest` («агенту алекса, …»), open or closed; the thread last
+        talked with, even if it was closed since; or the only open one."""
         if n is not None:
-            return next((t for t in self.threads if t.number == n), None)
-        if self.focus in self.threads:
-            return self.focus
-        return self.threads[0] if len(self.threads) == 1 else None
+            return next((t for t in self.threads if t.number == n), None), rest
+        named = self._by_name(rest)
+        if named:
+            return named
+        if isinstance(self.focus, Saved) or self.focus in self.threads:
+            return self.focus, rest
+        return (self.threads[0] if len(self.threads) == 1 else None), rest
+
+    def _by_name(self, rest: str) -> tuple[Thread | Saved, str] | None:
+        """The thread whose name (title tag or folder) the first one or two words of `rest` are.
+        Open threads win ties, then the most recently used session."""
+        words = rest.split()
+        live = {t.session for t in self.threads}
+        candidates: list[tuple[Thread | Saved, list[str]]] = [(t, _names(t.name, t.cwd)) for t in self.threads]
+        candidates += [(s, _names(s.name, s.cwd)) for s in saved_sessions(self.sessions) if s.session not in live]
+        best, best_score = None, NAME_MATCH
+        for k in (2, 1):
+            spoken = " ".join(words[:k]).strip(",.:;!?—- ")
+            if len(words) < k or len(re.sub(r"\W", "", spoken)) < 4:
+                continue
+            for target, names in candidates:
+                s = score(spoken, *names) if names else 0.0
+                if s > best_score:
+                    best, best_score = (target, " ".join(words[k:]).lstrip(",.:;!?—- ")), s
+        return best
 
     def _describe(self, lang: str) -> str:
         ru = lang == "ru"
@@ -216,25 +301,31 @@ class Agents:
     # Starting threads ----------------------------------------------------
     async def start(self, task: str, lang: str) -> str:
         ru = lang == "ru"
-        n = self._free_number()
-        token = uuid.uuid4().hex[:8]
-        launch = ["--cwd", str(self.cwd), "--", "env", f"SPEAKER_THREAD={token}", f"SPEAKER_BRAIN_URL={self.url}",
-                  *self.command]
-        # A tab in the session; the first thread creates the session.
-        ok, err = await _tern("new", "tab", self.session, *launch)
-        if not ok and "no session is called" in err:
-            ok, err = await _tern("new", "session", self.session, *launch)
-        if not ok:
-            log.error("tern failed: %s", err)
+        n = await self._launch(str(self.cwd), self.command, {"type": "prompt", "text": task}, lang)
+        if n is None:
             return "Не получилось запустить агента." if ru else "I couldn't start an agent."
-        log.info("started thread %d in Tern session %s: %s", n, self.session, task)
-        self.starting[token] = (n, task, lang)
-        watch = asyncio.create_task(self._watch_start(token))
-        self._tasks.add(watch)
-        watch.add_done_callback(self._tasks.discard)
+        log.info("started thread %d: %s", n, task)
         if not self.threads:
             return "Запускаю агента." if ru else "Starting an agent."
         return f"Запускаю агента номер {speech.ru_number(n)}." if ru else f"Starting agent {n}."
+
+    async def _launch(self, cwd: str, command: list[str], first: dict, lang: str) -> int | None:
+        """Run omp `command` as a new tab of the Tern session; once it connects it gets message `first`.
+        Returns the number it will have, or None when Tern failed."""
+        n = self._free_number()
+        token = uuid.uuid4().hex[:8]
+        launch = ["--cwd", cwd, "--", "env", f"SPEAKER_THREAD={token}", f"SPEAKER_BRAIN_URL={self.url}", *command]
+        ok, err = await _tern("new", "tab", self.session, *launch)
+        if not ok and "no session is called" in err:  # the first thread creates the session
+            ok, err = await _tern("new", "session", self.session, *launch)
+        if not ok:
+            log.error("tern failed: %s", err)
+            return None
+        self.starting[token] = (n, first, lang)
+        watch = asyncio.create_task(self._watch_start(token))
+        self._tasks.add(watch)
+        watch.add_done_callback(self._tasks.discard)
+        return n
 
     async def _watch_start(self, token: str) -> None:
         await asyncio.sleep(START_TIMEOUT)
@@ -264,13 +355,15 @@ class Agents:
         kind = d.get("type")
         ru = t.lang == "ru"
         if kind == "hello":
-            t.session, t.name, t.cwd, t.busy = d.get("session", ""), d.get("name", ""), d.get("cwd", ""), \
-                bool(d.get("busy"))
+            t.session, t.file, t.name, t.cwd, t.busy = d.get("session", ""), d.get("file", ""), d.get("name", ""), \
+                d.get("cwd", ""), bool(d.get("busy"))
+            if isinstance(self.focus, Saved) and self.focus.session == t.session:
+                self.focus = t  # the closed thread you last talked with is back
             started = self.starting.pop(d.get("thread") or "", None)
             if started:
-                t.number, task, t.lang = started
+                t.number, first, t.lang = started
                 t.spawned, self.focus = True, t
-                await self._send(t, {"type": "prompt", "text": task})
+                await self._send(t, first)
             log.info("thread %d: %s in %s%s", t.number, t.session, t.cwd, " (started here)" if t.spawned else "")
         elif kind == "state":
             t.busy, t.name = bool(d.get("busy")), d.get("name") or t.name
@@ -309,4 +402,6 @@ class Agents:
         finally:
             self.threads.remove(t)
             log.info("thread %d disconnected", t.number)
+            if self.focus is t and t.file:  # closed: «скажи агенту …» reopens it
+                self.focus = Saved(t.session, t.file, t.cwd, t.name)
         return ws

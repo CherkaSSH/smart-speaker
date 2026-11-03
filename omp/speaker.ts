@@ -14,7 +14,7 @@
  * get the tools (restricted children don't admit extension tools).
  *
  * Protocol (JSON text frames):
- *   session -> brain  {"type": "hello", "session", "name", "cwd", "busy", "thread"}  on connect and session switch
+ *   session -> brain  {"type": "hello", "session", "file", "name", "cwd", "busy", "thread"}  on connect and session switch
  *                     {"type": "state", "busy", "name"}
  *                     {"type": "say", "text"}                    speaker_say
  *                     {"type": "ask", "id", "text"}              speaker_ask; the brain answers with "answer"
@@ -89,6 +89,7 @@ export default function speaker(pi: ExtensionAPI) {
 		send({
 			type: "hello",
 			session: ctx?.sessionManager.getSessionId() ?? "",
+			file: ctx?.sessionManager.getSessionFile() ?? "",
 			name: pi.getSessionName() ?? "",
 			cwd: ctx?.cwd ?? "",
 			busy,

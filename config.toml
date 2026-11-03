@@ -188,6 +188,10 @@ cwd = "~/projects"
 command = ["omp"]
 # The Tern session that holds the threads the speaker starts, one tab each.
 tern_session = "agents"
+# omp's session files. A closed thread reopens from here when you talk to it:
+# the one you last talked with, or one named by its title tag («скажи агенту
+# алекса …» for "ALEXA: …") or folder.
+sessions = "~/.omp/agent/sessions"
 
 [memory]
 # EmbeddingGemma 2 (Q8_0 GGUF from ggml-org/embeddinggemma-2-GGUF) served by
