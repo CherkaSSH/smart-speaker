@@ -9,7 +9,9 @@
  *   answer  - deliver the spoken reply to a speaker_ask question
  * Once the user has spoken to a session, the agent gets two tools: speaker_say and speaker_ask.
  * Sessions the speaker starts itself (SPEAKER_THREAD set) have them from the start, and their
- * built-in `ask` is redirected to speaker_ask, since nobody is at that terminal.
+ * built-in `ask` is redirected to speaker_ask: they were started by voice, the user may not be at the screen.
+ * Only main sessions connect; subagents, the advisor and print/json runs don't, and subagents can't
+ * get the tools (restricted children don't admit extension tools).
  *
  * Protocol (JSON text frames):
  *   session -> brain  {"type": "hello", "session", "name", "cwd", "busy", "thread"}  on connect and session switch
@@ -191,7 +193,7 @@ export default function speaker(pi: ExtensionAPI) {
 		send({ type: "state", busy, name: pi.getSessionName() ?? "" });
 	});
 
-	// Nobody watches a terminal the speaker opened: its questions must be spoken.
+	// A session the speaker started by voice asks by voice.
 	pi.on("tool_call", async event => {
 		if (THREAD && event.toolName === "ask")
 			return {

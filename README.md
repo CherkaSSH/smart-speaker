@@ -60,13 +60,13 @@ mkdir -p ~/.omp/agent/extensions
 ln -s "$PWD/omp/speaker.ts" ~/.omp/agent/extensions/speaker.ts
 ```
 
-- **«Запусти агента, …»** starts a new omp session in `[omp] cwd` with that task, in a detached tmux session (`tmux ls`, `tmux attach -t agent-1-…` to watch or type). Without a task it asks «Что сделать агенту?».
+- **«Запусти агента, …»** starts a new omp session in `[omp] cwd` with that task, as a tab of the Tern session `[omp] tern_session` («agents»). Tern's daemon keeps it running across brain restarts, and it shows in your Tern window, where you can watch it or type into it. Without a task it asks «Что сделать агенту?».
 - **«Скажи агенту …»** sends what follows as a message: it starts a turn, or steers the running one at its next step. It shows in the session as «[голосом через колонку] …».
 - **«Спроси агента …»** asks a side question, like `/btw`: answered from the session's context in a separate model call, without touching the running turn.
 - **«Какие агенты?»** lists the threads: number, title and whether each is working.
-- With several threads, name one by number: «скажи второму агенту …», «спроси агента три …». Without a number the request goes to the thread you last talked with or that last spoke, or to the only one.
+- With several threads, name one by number: «скажи второму агенту …», «спроси агента три …». Without a number the request goes to the thread you last talked with or that last spoke, or to the only one. Only main sessions become threads: subagents, the advisor and `omp -p` runs don't connect, and subagents don't get the speaker tools.
 
-Once you have spoken to a session, its agent gets two tools: `speaker_say` (say something aloud: progress, the outcome) and `speaker_ask` (ask aloud and wait up to two minutes for the spoken answer; the speaker listens right after the question, and later answers need the wake phrase within 30 seconds). Sessions the speaker started have them from the start, and their built-in `ask` is redirected to `speaker_ask`, since nobody watches that terminal. When a run you asked for by voice ends without the agent speaking, the speaker says «Агент закончил.» and the start of its final answer. Agents' messages wait until you are done talking to the speaker, then play over ducked music; with several threads they start with «Агент два: …».
+Once you have spoken to a session, its agent gets two tools: `speaker_say` (say something aloud: progress, the outcome) and `speaker_ask` (ask aloud and wait up to two minutes for the spoken answer; the speaker listens right after the question, and later answers need the wake phrase within 30 seconds). Sessions the speaker started have them from the start, and their built-in `ask` is redirected to `speaker_ask`, since you started them by voice and may not be at the screen. When a run you asked for by voice ends without the agent speaking, the speaker says «Агент закончил.» and the start of its final answer. Agents' messages wait until you are done talking to the speaker, then play over ducked music; with several threads they start with «Агент два: …».
 
 Any omp session on the machine can be driven this way once the extension is installed, with the same tools and permissions as when you type into it; the brain listens on localhost only by default (`[brain] host`).
 

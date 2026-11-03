@@ -180,12 +180,14 @@ offer_big_model = true
 # omp/speaker.ts (symlinked into ~/.omp/agent/extensions/) connect to the
 # brain's /omp endpoint: «скажи агенту …» sends a message, «спроси агента …»
 # a side question, «какие агенты?» lists them. «запусти агента …» starts a new
-# session with that task in a detached tmux session (`tmux ls`, then attach).
+# session with that task as a tab of Tern session `tern_session`.
 enabled = true
 # Where new threads start.
 cwd = "~/projects"
-# The command a new thread runs in tmux (argv); omp, plus any flags.
+# The command a new thread runs (argv); omp, plus any flags.
 command = ["omp"]
+# The Tern session that holds the threads the speaker starts, one tab each.
+tern_session = "agents"
 
 [memory]
 # EmbeddingGemma 2 (Q8_0 GGUF from ggml-org/embeddinggemma-2-GGUF) served by

@@ -2,7 +2,9 @@
 
 Every omp session that loads omp/speaker.ts connects to the brain's /omp WebSocket
 (see that file for the protocol). Sessions you opened yourself are found that way;
-«запусти агента …» opens a new one in a detached tmux session and gives it the task.
+«запусти агента …» opens a new one as a tab of a Tern session (the terminal's daemon keeps
+it running; it shows in your Tern window) and gives it the task. Only main sessions connect:
+subagents, advisors and print-mode runs never become threads.
 Threads are numbered from one, in the order they connect, so they can be named by voice:
 «скажи второму агенту …», «спроси агента три …». Without a number the request goes to
 the thread you last talked with, or to the only one.
@@ -17,8 +19,6 @@ import asyncio
 import json
 import logging
 import re
-import shlex
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +88,14 @@ def parse(text: str) -> tuple[str, int | None, str] | None:
     return None
 
 
+async def _tern(*args: str) -> tuple[bool, str]:
+    """Run a `tern` command against the Tern daemon: (succeeded, its error output)."""
+    proc = await asyncio.create_subprocess_exec("tern", *args, stdout=asyncio.subprocess.DEVNULL,
+                                                stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    return proc.returncode == 0, err.decode(errors="replace").strip()
+
+
 def _short(text: str, limit: int = DONE_CHARS) -> str:
     """The first sentences of `text` that fit in `limit` characters."""
     text = clean(text)
@@ -122,6 +130,7 @@ class Agents:
         self.enabled = bool(cfg["enabled"])
         self.cwd = brain.cfg.file(cfg["cwd"])
         self.command = list(cfg["command"])
+        self.session = cfg["tern_session"]  # the Tern session new threads open in, as tabs
         self.url = url  # where the threads we start connect back to
         self.threads: list[Thread] = []
         self.focus: Thread | None = None
@@ -209,16 +218,16 @@ class Agents:
         ru = lang == "ru"
         n = self._free_number()
         token = uuid.uuid4().hex[:8]
-        name = f"agent-{n}-{token[:4]}"
-        argv = ["tmux", "new-session", "-d", "-s", name, "-c", str(self.cwd),
-                "-e", f"SPEAKER_THREAD={token}", "-e", f"SPEAKER_BRAIN_URL={self.url}", shlex.join(self.command)]
-        proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.DEVNULL,
-                                                    stderr=asyncio.subprocess.PIPE)
-        _, err = await proc.communicate()
-        if proc.returncode:
-            log.error("tmux failed: %s", err.decode(errors="replace").strip())
+        launch = ["--cwd", str(self.cwd), "--", "env", f"SPEAKER_THREAD={token}", f"SPEAKER_BRAIN_URL={self.url}",
+                  *self.command]
+        # A tab in the session; the first thread creates the session.
+        ok, err = await _tern("new", "tab", self.session, *launch)
+        if not ok and "no session is called" in err:
+            ok, err = await _tern("new", "session", self.session, *launch)
+        if not ok:
+            log.error("tern failed: %s", err)
             return "Не получилось запустить агента." if ru else "I couldn't start an agent."
-        log.info("started thread %d in tmux session %s: %s", n, name, task)
+        log.info("started thread %d in Tern session %s: %s", n, self.session, task)
         self.starting[token] = (n, task, lang)
         watch = asyncio.create_task(self._watch_start(token))
         self._tasks.add(watch)
