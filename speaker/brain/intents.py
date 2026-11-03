@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING
 
 from . import speech
+from .music import MY_WAVE
 from .numbers import parse_duration, parse_number
 
 if TYPE_CHECKING:
@@ -197,22 +198,40 @@ async def _music(brain: "Brain", t: str, words: list[str], ru: bool) -> str | No
         if cur is None:
             return "Сейчас ничего не играет." if ru else "Nothing is playing."
         return f"Это {cur.label('ru')}." if ru else f"This is {cur.label('en')}."
+    if _has(t, r"\b(волн\w*|радио) по (это\w* |текущ\w* )?(трек\w*|песн\w*)|\bmore like this\b|"
+               r"\b(songs|music|something) (like this|similar)\b|\bwave (from|based on) this\b") \
+            or active and short and _has(t, r"^(включи|поставь|давай|play) (\w+ )?(похож\w*|similar)\b"):
+        cur = music.current
+        if cur is None:
+            return "Сейчас ничего не играет." if ru else "Nothing is playing."
+        if await music.similar() is None:
+            return "Похожего не нашёл." if ru else "I couldn't find anything similar."
+        return f"Включаю волну по треку {cur.label('ru')}." if ru else f"Playing songs like {cur.label('en')}."
     m = re.search(_PLAY, t)
     if m:
         rest = re.sub(_FILLER, " ", m.group(2))
-        radio = _has(rest, r"\b(радио|radio)\b")
+        radio = _has(rest, r"\b(радио|radio|волн\w*|wave)\b")  # Yandex calls its radio «волна»
         query = re.sub(r"\s+", " ", rest).strip()
         station = re.sub(r"\b(радио|radio)\b", "", query).strip()
         if _has(query, _DEVICES):
             return None  # "включи свет": the LLM explains it can't control devices
         if not brain.clients:
             return "Голосовой модуль не подключён." if ru else "The voice service is not connected."
-        track = await music.play(station if radio else query, radio)
+        if radio:
+            track = await music.play(station, True)
+        elif query and _has(m.group(2), r"\b(музык\w*|music)\b"):  # «спокойную музыку»: a wave, else a search
+            track = await music.play(query, True) or await music.play(query)
+        else:
+            track = await music.play(query)
         if track is None:
             if m.group(1) in ("поставь", "put on"):
                 return None  # "поставь напоминание ...": not necessarily music
             return f"Не нашёл «{query}»." if ru else f"I couldn't find {query}."
-        if radio and not station:
+        if track.station == MY_WAVE and query:
+            return "Включаю мою волну." if ru else "Playing My Wave."
+        if track.station and track.station != MY_WAVE:
+            return f"Включаю волну {track.station}." if ru else f"Playing the {track.station} wave."
+        if radio:
             return f"Включаю радио {track.title}." if ru else f"Playing {track.title} radio."
         if not query:
             return "Включаю музыку." if ru else "Playing some music."

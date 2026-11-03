@@ -96,7 +96,18 @@ Music turns down to `duck_volume` while the speaker listens, thinks or answers, 
 
 **Navidrome** (or any Subsonic server): set `url` and `user` in `[music] navidrome` and export the password under the name in `password_env` (default `NAVIDROME_PASSWORD`). Requests use Subsonic token auth, so the password itself is not sent. Navidrome's search is word-based and wouldn't find "My Bonnie" from «май бонни», so the provider fetches the whole song list (500 songs per request, refreshed every 10 minutes) and matches it like the local library: title, artist and album.
 
-**Yandex Music** (through the [`yandex-music`](https://github.com/MarshalX/yandex-music-api) library): run `speaker yandex-login`, open the printed page, enter the code, and export the printed `YANDEX_MUSIC_TOKEN=...`. Full tracks need an account with Yandex Plus; without a token the API serves 30-second previews and there is no My Wave. Yandex's own search handles misheard names, and its best result decides what plays: a song, an artist's popular songs («включи земфиру»), an album or a playlist. With `"yandex"` first in `providers`, «включи музыку» plays My Wave. On this machine about 1 in 4 new TLS connections to the API stalled for 5 s and was reset, so the provider keeps connections alive and retries a failed request once. Starting a track then takes 0.6–0.9 s (search, download info, signed link); the first one also signs in (3.7 s).
+**Yandex Music** (through the [`yandex-music`](https://github.com/MarshalX/yandex-music-api) library): run `speaker yandex-login`, open the printed page, enter the code, and export the printed `YANDEX_MUSIC_TOKEN=...`. Full tracks need an account with Yandex Plus; without a token the API serves 30-second previews and there are no waves. Yandex's own search handles misheard names, and its best result decides what plays: a song, an artist's popular songs («включи земфиру»), an album or a playlist. On this machine about 1 in 4 new TLS connections to the API stalled for 5 s and was reset, so the provider keeps connections alive and retries a failed request once. Starting a track then takes 0.6–0.9 s (search, download info, signed link); the first one also signs in (3.7 s).
+
+Yandex's radio is its waves, each an endless stream in batches of five:
+
+| Say | Plays |
+|---|---|
+| «включи музыку», «включи радио», «включи мою волну» | My Wave |
+| «включи радио рок», «включи волну джаз», «включи рок», «включи спокойную музыку», «радио для тренировки», «радио девяностых» | the wave for that genre, mood, activity or decade («Рок», «Джаз», «Спокойное», «Тренируюсь», «1990-е»); 600 of them, by name |
+| «включи волну по этому треку», «включи похожее» | a wave seeded by the song playing; a local or Navidrome song is looked up on Yandex first |
+| «следующая» at the end of a batch | the next batch |
+
+Wave names are matched by whole words and Russian stems (тренировки → Тренируюсь, рэп → Русский рэп). A name needs 0.8 similarity, and a name under four letters must match whole, so «радио groove salad» still reaches the internet station and «музыку ддт» plays ДДТ instead of the «Даб» wave. «…музыку» with a description tries a wave first, then a normal search («музыку битлз»). Like the app, the speaker reports each started, finished and skipped wave track: without that, 7–9 of 20 tracks in the next batches repeated; with it, none did, and skips teach My Wave.
 
 Spotify doesn't hand out stream URLs, so it would need a Spotify Connect receiver such as librespot instead of a provider.
 

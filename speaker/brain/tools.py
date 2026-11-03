@@ -61,11 +61,13 @@ SCHEMAS = [
         {"query": {"type": "string", "description": "What to find, in natural language"},
          "limit": {"type": "integer", "description": "Maximum results, 1-10; default 5"}}, ["query"]),
     _fn("play_music", "Play recorded music when the user asks to play or turn on a song, an artist, any music "
-        "(empty query) or an internet radio station. Not for stories, fairy tales or poems: tell those yourself.",
+        "(empty query) or radio. Not for stories, fairy tales or poems: tell those yourself.",
         {"query": {"type": "string", "description": "Song title or artist as the user said it; empty for any music"},
-         "radio": {"type": "boolean", "description": "True for an internet radio station"}}),
-    _fn("music_control", "Control the music that is playing.",
-        {"action": {"type": "string", "enum": ["pause", "resume", "next", "previous", "stop"]}}, ["action"]),
+         "radio": {"type": "boolean", "description": "True for radio or a wave: an internet station, or a genre, "
+                   "mood, activity or decade like 'рок', 'спокойное', 'для тренировки', '90-х', 'моя волна'"}}),
+    _fn("music_control", "Control the music that is playing. similar: a wave of songs like the current one.",
+        {"action": {"type": "string", "enum": ["pause", "resume", "next", "previous", "stop", "similar"]}},
+        ["action"]),
 ]
 
 WEB_SEARCH_SCHEMA = _fn(
@@ -298,8 +300,12 @@ class Tools:
             known = local.titles()[:30] if local else []
             return {"error": f"nothing found for {query!r}", "library": known,
                     "stations": list(self.brain.cfg["music"].get("radio", {}))}
-        return {"playing": track.label(self.lang)}
+        return {"playing": track.label(self.lang), **({"wave": track.station} if track.station else {})}
 
     async def t_music_control(self, action: str) -> dict:
+        if action == "similar":
+            track = await self.brain.music.similar()
+            return {"playing": track.label(self.lang), "wave": track.station} if track else \
+                {"error": "nothing is playing or no similar songs found"}
         ok = await self.brain.music.control(action)
         return {"ok": ok, "state": self.brain.music.state}

@@ -77,8 +77,9 @@ echo_music_model = "models/localvqe-pi-aec-v1-49k-f32.gguf"
 library = "music"
 # Where music comes from. A request plays from the first provider here that
 # finds something: "local" = the library, "navidrome" and "yandex" = the
-# streaming services below. "radio" (the stations below) answers only radio
-# requests. With "yandex" first, «включи музыку» plays My Wave.
+# streaming services below. Radio requests go to Yandex's waves (genre, mood,
+# decade: «включи радио рок») and "radio", the internet stations below. With
+# "yandex" first, «включи музыку» and «включи радио» play My Wave.
 providers = ["local", "radio"]
 # Music volume while you talk or the speaker answers (fraction of normal).
 duck_volume = 0.2
