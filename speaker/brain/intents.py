@@ -12,9 +12,10 @@ import re
 import time
 from typing import TYPE_CHECKING
 
-from . import books, extras, speech
+from . import books, extras, help, speech
 from .music import MY_WAVE
 from .numbers import parse_duration, parse_number
+from .timers import next_due, normalize_repeat, repeat_days
 
 if TYPE_CHECKING:
     from .server import Brain
@@ -37,6 +38,28 @@ def _has(text: str, pattern: str) -> bool:
 
 _CANCEL = r"\b(отмени\w*|отключи\w*|выключи\w*|удали\w*|сбрось\w*|останови\w*|убери\w*|cancel|stop|delete|remove|turn off)\b"
 _TIMER = r"\b(таймер\w*|будильник\w*|timer\w*|alarm\w*)\b"
+
+# Not names: what a bare answer to «как тебя зовут?» may hold instead.
+_NOT_NAMES = {"да", "нет", "не", "ну", "это", "меня", "мое", "моё", "имя", "зовут", "как", "what", "my", "name",
+              "who", "i", "am", "is", "the", "ты", "вы", "я", "пожалуйста", "незнаю", "ой", "э", "эм", "ээ", "эээ",
+              "хм", "ам", "так", "ладно", "хорошо", "привет", "здравствуй", "стоп", "отмена", "хватит", "yes", "no",
+              "hi", "hello", "um", "uh", "ok", "okay", "cancel", "stop"}
+
+
+def parse_name(text: str) -> str | None:
+    """The name in «меня зовут Миша», "my name is Misha", or a bare «Миша» / «я Миша»."""
+    m = re.search(r"(?:меня зовут|мо[её] имя|зови меня|my name is|call me)\s+([A-Za-zА-Яа-яЁё-]{2,})", text, re.I)
+    if m:
+        word = m.group(1)
+    else:
+        spoken = re.findall(r"[A-Za-zА-Яа-яЁё-]+", text)
+        words = [w for w in spoken if w.casefold() not in _NOT_NAMES]
+        if len(words) != 1 or len(spoken) > 2:
+            return None  # a sentence is not a name
+        word = words[0]
+    if len(word) < 2 or word.casefold() in _NOT_NAMES:
+        return None
+    return word[:1].upper() + word[1:]
 
 
 def parse_clock(t: str) -> tuple[int, int] | None:
@@ -76,10 +99,143 @@ def alarm_music(t: str) -> str | None:
     if m:
         tail = m.group(1).strip(" ,.")
         tail = re.sub(r"^(музыку|музыка|музыкой|music)\b\s*", "", tail).strip(" ,.")
-        if tail in ("утра", "вечера", "дня", "ночи", "утром", "вечером"):
-            return None
+        if tail in ("утра", "вечера", "дня", "ночи", "утром", "вечером") \
+                or re.match(r"(\d|по\b|кажд\w*|выходн\w*|будн\w*)", tail):
+            return None  # «с понедельника», «с 7 утра»: not a song
         return tail
     return "" if _has(t, r"\b(музык\w*|music)\b") else None
+
+
+_DAY_STEMS = (("понед", "mon"), ("вторн", "tue"), ("сред", "wed"), ("четверг", "thu"),
+              ("пятниц", "fri"), ("суббот", "sat"), ("воскрес", "sun"))
+_EN_DAYS = {"monday": "mon", "tuesday": "tue", "wednesday": "wed", "thursday": "thu",
+            "friday": "fri", "saturday": "sat", "sunday": "sun"}
+_RU_DAY_EACH = {"mon": "каждый понедельник", "tue": "каждый вторник", "wed": "каждую среду",
+                "thu": "каждый четверг", "fri": "каждую пятницу", "sat": "каждую субботу",
+                "sun": "каждое воскресенье"}
+_RU_DAY_DAT = {"mon": "понедельникам", "tue": "вторникам", "wed": "средам", "thu": "четвергам",
+               "fri": "пятницам", "sat": "субботам", "sun": "воскресеньям"}
+_EN_DAY = {"mon": "Monday", "tue": "Tuesday", "wed": "Wednesday", "thu": "Thursday",
+           "fri": "Friday", "sat": "Saturday", "sun": "Sunday"}
+_DAY_CODES = list(_EN_DAY)  # Monday first: repeat_days() numbers are indexes into this
+
+
+def recurrence(t: str) -> str | None:
+    """Repeat rule of «по будням», «каждый понедельник», "every weekend" — or None."""
+    if _has(t, r"\b(по будням|по будничным|в будни|будние дни|по рабочим дням|каждый будний день|"
+               r"weekdays?|every weekday|on weekdays?)\b"):
+        return "weekdays"
+    if _has(t, r"\b(по выходным|в выходные|выходные|weekends?|every weekend|on weekends?)\b"):
+        return "weekends"
+    if _has(t, r"\b(каждый день|каждое утро|каждые сутки|ежедневно|every day|every morning|daily)\b"):
+        return "daily"
+    # Several days: «по вторникам и четвергам», "every tuesday and thursday".
+    ru_list, en_list = _has(t, r"\bпо\b"), _has(t, r"\b(every|on|for)\b")
+    days = [day for stem, day in _DAY_STEMS
+            if _has(t, rf"\b(?:по|кажд\w*|every|on|for)\s+{stem}\w*") or (ru_list and _has(t, rf"\b{stem}\w*"))]
+    days += [day for word, day in _EN_DAYS.items()
+             if _has(t, rf"\b(?:every|on|for)\s+{word}s?\b") or (en_list and _has(t, rf"\b{word}s?\b"))]
+    return normalize_repeat(",".join(days)) or None if days else None
+
+
+def _join_and(parts: list[str], word: str) -> str:
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + f" {word} " + parts[-1]
+
+
+def repeat_text(rule: str | None, lang: str) -> str:
+    """«каждый будний день», «по понедельникам и четвергам», "every Monday"."""
+    days = sorted(repeat_days(rule))
+    if not days:
+        return ""
+    if days == list(range(5)):
+        return "каждый будний день" if lang == "ru" else "every weekday"
+    if days == [5, 6]:
+        return "по выходным" if lang == "ru" else "on weekends"
+    if len(days) == 7:
+        return "каждый день" if lang == "ru" else "every day"
+    if lang == "ru":
+        if len(days) == 1:
+            return _RU_DAY_EACH[_DAY_CODES[days[0]]]
+        return "по " + _join_and([_RU_DAY_DAT[_DAY_CODES[d]] for d in days], "и")
+    return "every " + _join_and([_EN_DAY[_DAY_CODES[d]] for d in days], "and")
+
+
+def _ru_date(at: dt.datetime) -> str:
+    day = speech.num2words(at.day, lang="ru", to="ordinal")
+    day = day[:-2] + ("ье" if day.endswith("ий") else "ое")  # "тридцать первое", "третье"
+    return f"{day} {_RU_MONTHS[at.month - 1]}"
+
+
+def _when(item, now: dt.datetime, lang: str) -> str:
+    """One line of «какие будильники?»: «каждый будний день в семь часов», «осталось пять минут»."""
+    ru = lang == "ru"
+    if item.kind == "timer":
+        left = speech.duration(item.remaining(), lang)
+        return f"осталось {left}" if ru else f"{left} left"
+    at = dt.datetime.fromtimestamp(item.due)
+    clock = speech.clock(at.hour, at.minute, lang)
+    rule = repeat_text(item.repeat, lang)
+    if rule:
+        when = f"{rule} в {clock}" if ru else f"{rule} at {clock}"
+    else:
+        days = (at.date() - now.date()).days
+        if days == 0:
+            when = f"сегодня в {clock}" if ru else f"today at {clock}"
+        elif days == 1:
+            when = f"завтра в {clock}" if ru else f"tomorrow at {clock}"
+        elif ru:
+            when = f"{_ru_date(at)} в {clock}"
+        else:
+            when = f"on {at:%B} {at.day} at {clock}"
+    if item.label:
+        return f"напоминание «{item.label}», {when}" if ru else f"reminder {item.label}, {when}"
+    return when
+
+
+def _list_timers(brain: "Brain", kind: str | None, lang: str, ru: bool) -> str:
+    now = dt.datetime.now()
+    alarms = brain.scheduler.pending("alarm") if kind != "timer" else []
+    timers = brain.scheduler.pending("timer") if kind != "alarm" else []
+    parts = []
+    if alarms:
+        parts.append(("Будильники: " if ru else "Alarms: ") + "; ".join(_when(i, now, lang) for i in alarms))
+    if timers:
+        parts.append(("Таймеры: " if ru else "Timers: ") + "; ".join(_when(i, now, lang) for i in timers))
+    if parts:
+        return ". ".join(parts) + "."
+    if ru:
+        return "Будильников нет." if kind == "alarm" else "Таймеров нет." if kind == "timer" else \
+            "Ничего не заведено."
+    return f"No {kind}s." if kind else "Nothing is set."
+
+
+def _matching_repeat(items, rule: str) -> list:
+    """«отмени будильник по будням»: the same rule, or (none matching) any alarm covering its days."""
+    same = [i for i in items if i.repeat == rule]
+    if same:
+        return same
+    days = repeat_days(rule)
+    return [i for i in items if i.repeat and repeat_days(i.repeat) & days]
+
+
+def reminder_label(t: str) -> str:
+    """«каждый понедельник в 9 напоминай про спортзал» -> "спортзал"; "" when there is none."""
+    m = re.search(r"\b(?:напом(?:н|ин)\w*|remind(?:\s+me)?)\b.*?\b(?:про|о|об|about)\s+(.+)$", t)
+    if not m:
+        return ""
+    label = re.sub(r"\b(?:в|на|at)\s+\d.*$", "", m.group(1)).strip(" ,.")
+    return re.sub(r"^(кажд\w*|every)\b.*", "", label).strip(" ,.")
+
+
+def _night_schedule(brain: "Brain", ru: bool) -> str:
+    a = brain.cfg["audio"]
+    start, end = str(a.get("night_start") or ""), str(a.get("night_end") or "")
+    volume = int(a.get("night_volume") or 0)
+    if not start or not end or start == end:
+        return "Ночной режим выключен." if ru else "Night mode is off."
+    if ru:
+        return f"Ночной режим с {start} до {end}, громкость в это время — {speech.ru_number(volume, True)}."
+    return f"Night mode from {start} to {end}, volume at most {volume}."
 
 
 async def handle(brain: "Brain", text: str, lang: str) -> str | None:
@@ -110,50 +266,140 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
                 return "Already at maximum." if louder else "Already at minimum."
             return f"Громкость {speech.ru_number(brain.volume, True)}." if ru else f"Volume {speech.num2words(brain.volume)}."
 
+    # Repeat the last answer, and «что ты умеешь?» -------------------------
+    reply = await help.handle(brain, t, words, lang, ru)
+    if reply is not None:
+        return reply
+
+    # Voice profiles -----------------------------------------------------
+    # Who is talking comes from the voice service (`brain.speaker` during a turn).
+    speaker = brain.speaker
+    if _has(t, r"\b(запомни|запиши|сохрани)\b.*\bголос\w*\b|\bremember my voice\b"):
+        name = parse_name(text)
+
+        async def begin(who: str) -> str:
+            await brain.start_voice_enroll(who, lang)
+            return f"Хорошо, {who}. Скажи три фразы, которые я попрошу." if ru else \
+                f"Okay {who}. Say the three phrases I'll ask for."
+
+        async def ask_name(answer: str | None, retry: bool = True) -> str | None:
+            who = parse_name(answer or "")
+            if who:
+                return await begin(who)
+            if retry:  # one more try: the next words are the name again
+                brain.pending = brain.expect_reply(lang, lambda a: ask_name(a, retry=False))
+                return "Не понял имя. Как тебя зовут?" if ru else "I didn't catch the name. What is it?"
+            return "Ладно, запишем голос в другой раз." if ru else "Okay, we'll record your voice another time."
+
+        if name is None:
+            brain.pending = brain.expect_reply(lang, ask_name)
+            return "Как тебя зовут?" if ru else "What's your name?"
+        return await begin(name)
+    if _has(t, r"\b(забудь|удали|сотри|убери)\b.*\bголос\w*\b|\bforget my voice\b"):
+        if not speaker:
+            return "Я тебя не узнаю, так что забывать нечего." if ru else "I don't recognise you, so there's nothing to forget."
+        await brain.forget_voice(speaker)
+        return f"Забыл твой голос, {speaker}." if ru else f"I forgot your voice, {speaker}."
+    if len(words) <= 4 and _has(t, r"\b(как меня зовут|кто я|мое имя|who am i|what'?s my name)\b"):
+        if speaker:
+            return f"Ты {speaker}." if ru else f"You're {speaker}."
+        return "Не знаю, кто вы." if ru else "I don't know who you are."
+    if _has(t, r"\b(чьи голоса|какие голоса|кого ты знаешь|whose voices)\b"):
+        names = list(brain.voice_names)
+        if not names:
+            return "Пока ничьи: я не знаю ни одного голоса." if ru else "None yet: I don't know any voice."
+        return "Я знаю голоса: " + ", ".join(names) + "." if ru else "I know these voices: " + ", ".join(names) + "."
+
     # Extras: sleep timer, morning show, news, rates, shopping list -------
     reply = await extras.handle(brain, t, words, lang, ru)
     if reply is not None:
         return reply
 
-    # Timers ------------------------------------------------------------
+    # Night mode --------------------------------------------------------
+    if len(words) <= 6 and _has(t, r"\b(ночн\w* режим|night mode)\b"):
+        if _has(t, r"\b(когда|во сколько|what time|when)\b"):
+            return _night_schedule(brain, ru)
+        if _has(t, _CANCEL):
+            await brain.set_night(False)
+            return "Ночной режим выключен." if ru else "Night mode off."
+        if _has(t, r"\b(по расписанию|как обычно|обратно|automatic|schedule)\b"):
+            await brain.set_night(None)
+            return "Ночной режим по расписанию." if ru else "Night mode on its schedule."
+        await brain.set_night(True)
+        return "Ночной режим включён." if ru else "Night mode on."
+
+    # Timers and alarms -------------------------------------------------
+    repeat = recurrence(t)
     if _has(t, _TIMER) and _has(t, _CANCEL):
         kind = "alarm" if _has(t, r"\b(будильник\w*|alarm\w*)\b") else "timer"
         items = brain.scheduler.pending(kind)
+        if repeat:
+            items = _matching_repeat(items, repeat)
+            if not items:
+                return "Такого будильника нет." if ru else "There's no such alarm."
         if not items:
             return ("Будильников" if kind == "alarm" else "Таймеров") + " и так нет." if ru else f"There are no {kind}s."
         brain.scheduler.cancel(items)
         if ru:
-            return "Отменил." if len(items) == 1 else f"Отменил все, {speech.ru_number(len(items))} штук."
+            n = len(items)
+            return "Отменил." if n == 1 else \
+                f"Отменил все: {speech.ru_number(n, True)} {speech.ru_plural(n, 'штука', 'штуки', 'штук')}."
         return "Cancelled." if len(items) == 1 else f"Cancelled all {speech.num2words(len(items))}."
 
-    wake_me = _has(t, r"^(разбуди\w*|wake me)\b")
-    # Labelled timers and alarms ("для пельменей", "с подписью работа") go to the LLM, which fills the label.
-    labelled = _has(t, r"\b(для|чтобы|напомн\w*|подпис\w*|назов\w*|называ\w*|called|named|labell?ed|remind\w*|for the)\b")
+    if len(words) <= 6 and _has(t, r"\b(какие (у меня |сейчас |там )?(будильники|таймеры)|"
+                                     r"мои (будильники|таймеры)|список (будильников|таймеров)|"
+                                     r"(what|which) (alarms|timers)|list (the )?(alarms|timers))\b"):
+        asks_alarm = _has(t, r"\b(будильник\w*|alarm\w*)")
+        asks_timer = _has(t, r"\b(таймер\w*|timer\w*)")
+        return _list_timers(brain, "alarm" if asks_alarm and not asks_timer else
+                            "timer" if asks_timer and not asks_alarm else None, lang, ru)
+
+    wake_me = _has(t, r"^(разбуди\w*|буди меня|wake me)\b")
+    # Labelled timers and alarms ("для пельменей", "с подписью работа") go to the LLM, which fills the label;
+    # repeating ones («каждый понедельник в 9 напоминай про спортзал») are made here.
+    labelled = not repeat and _has(
+        t, r"\b(для|чтобы|напомн\w*|подпис\w*|назов\w*|называ\w*|called|named|labell?ed|remind\w*|for the)\b")
     if (_has(t, r"\b(таймер\w*|timer)\b") or wake_me or _has(t, r"^засеки\b")) and not labelled:
         seconds = parse_duration(t)
         if seconds:
-            brain.scheduler.add("timer", time.time() + seconds, lang, "", seconds)
+            brain.scheduler.add("timer", time.time() + seconds, lang, "", seconds, who=speaker)
             if ru:
                 return f"Засёк {speech.duration(seconds, 'ru', accusative=True)}."
             return f"Timer set for {speech.duration(seconds, 'en')}."
 
-    if (_has(t, r"\b(будильник\w*|alarm)\b") or wake_me) and not labelled:
+    reminder = bool(repeat) and _has(t, r"\b(напом(?:н|ин)\w*|remind\w*)\b")
+    if (_has(t, r"\b(будильник\w*|alarm)\b") or wake_me or reminder) and not labelled:
         at = parse_clock(t)
-        days = 2 if _has(t, r"\b(послезавтра|day after tomorrow)\b") else 1 if _has(t, r"\b(завтра|tomorrow)\b") else 0
         if at:
             hh, mm = at
             now = dt.datetime.now()
             when = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if days:
-                when += dt.timedelta(days=days)
-            elif when <= now:
-                when += dt.timedelta(days=1)
+            if repeat:
+                when = dt.datetime.fromtimestamp(next_due(when.timestamp(), repeat, now.timestamp()))
+            else:
+                days = 2 if _has(t, r"\b(послезавтра|day after tomorrow)\b") \
+                    else 1 if _has(t, r"\b(завтра|tomorrow)\b") else 0
+                if days:
+                    when += dt.timedelta(days=days)
+                elif when <= now:
+                    when += dt.timedelta(days=1)
             music = alarm_music(t)
-            brain.scheduler.add("alarm", when.timestamp(), lang, music=music)
+            label = reminder_label(t) if reminder else ""
+            brain.scheduler.add("alarm", when.timestamp(), lang, label, music=music, repeat=repeat, who=speaker)
+            tune = (f" Под «{music}»." if music else " С музыкой.") if music is not None else ""
+            if repeat:
+                rule = repeat_text(repeat, lang)
+                clock = speech.clock(hh, mm, lang)
+                if label:
+                    if ru:
+                        return f"Буду напоминать {rule} в {clock}: {label}."
+                    return f"I'll remind you {rule} at {clock}: {label}."
+                if ru:
+                    return f"Будильник {rule} в {clock}." + tune
+                return f"Alarm {rule} at {clock}." + tune
             offset = (when.date() - now.date()).days
             day = (["сегодня", "завтра", "послезавтра"] if ru else ["today", "tomorrow", "the day after tomorrow"])[offset]
             if music is not None:
-                tune = f" Под «{music}»." if music else " С музыкой."
                 if ru:
                     return f"Будильник на {day}, {speech.clock(hh, mm, 'ru')}." + tune
                 return f"Alarm set for {speech.clock(hh, mm, 'en')} {day}." + tune

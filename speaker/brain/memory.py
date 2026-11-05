@@ -4,6 +4,11 @@ Embeddings come from a llama-server running the EmbeddingGemma 2 GGUF
 (`speaker embed`), so the brain needs no PyTorch. Text and normalized
 768-dimensional vectors are stored in SQLite; search is a dot product over
 all rows, which is instant at personal-memory scale.
+
+Each row may belong to a recognised voice (`speaker`, the name from the
+voice profiles). A person sees their own memories plus the shared ones
+(`speaker IS NULL`: everyone, including everything saved before voice
+profiles existed). An unknown voice sees only the shared ones.
 """
 
 from __future__ import annotations
@@ -39,8 +44,12 @@ class Memory:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 text TEXT NOT NULL,
                 embedding BLOB NOT NULL,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                speaker TEXT
             )""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(memories)")}
+            if "speaker" not in columns:  # memories from before voice profiles: shared
+                db.execute("ALTER TABLE memories ADD COLUMN speaker TEXT")
 
     async def _embed(self, text: str) -> np.ndarray:
         if self._session is None:
@@ -51,23 +60,32 @@ class Memory:
             vector = np.asarray((await r.json())["data"][0]["embedding"], dtype=np.float32)
         return vector / np.linalg.norm(vector)
 
-    async def save(self, text: str) -> dict:
+    async def save(self, text: str, speaker: str | None = None) -> dict:
         text = text.strip()
         if not text:
             raise ValueError("memory text is empty")
         embedding = await self._embed(DOCUMENT + text)
         with sqlite3.connect(self.path) as db:
-            cursor = db.execute("INSERT INTO memories (text, embedding, created_at) VALUES (?, ?, ?)",
-                                (text, embedding.tobytes(), time.time()))
+            cursor = db.execute("INSERT INTO memories (text, embedding, created_at, speaker) VALUES (?, ?, ?, ?)",
+                                (text, embedding.tobytes(), time.time(), speaker))
         return {"id": cursor.lastrowid, "text": text}
 
-    async def search(self, query: str, limit: int | None = None) -> list[dict]:
+    def _visible(self, db: sqlite3.Connection, speaker: str | None) -> list[tuple]:
+        """This person's memories and the shared ones; only shared ones for an unknown voice."""
+        if speaker is None:
+            sql, args = "SELECT id, text, embedding, created_at FROM memories WHERE speaker IS NULL", ()
+        else:
+            sql = "SELECT id, text, embedding, created_at FROM memories WHERE speaker IS NULL OR speaker = ?"
+            args = (speaker,)
+        return db.execute(sql, args).fetchall()
+
+    async def search(self, query: str, limit: int | None = None, speaker: str | None = None) -> list[dict]:
         query = query.strip()
         if not query:
             raise ValueError("memory query is empty")
         limit = max(1, min(10, int(limit or self.results)))
         with sqlite3.connect(self.path) as db:
-            rows = db.execute("SELECT id, text, embedding, created_at FROM memories").fetchall()
+            rows = self._visible(db, speaker)
         if not rows:
             return []  # nothing to rank: skip the embedding request
         query_embedding = await self._embed(QUERY + query)
@@ -78,12 +96,12 @@ class Memory:
                  "saved_at": dt.datetime.fromtimestamp(rows[i][3]).isoformat(timespec="seconds")}
                 for i in order]
 
-    async def recall(self, text: str) -> list[str]:
-        """Memories relevant enough to hand the model without it asking."""
+    async def recall(self, text: str, speaker: str | None = None) -> list[str]:
+        """Memories relevant enough to hand the model without it asking (this speaker's and shared)."""
         if self.recall_threshold <= 0:
             return []
         try:
-            hits = await self.search(text, self.recall_results)
+            hits = await self.search(text, self.recall_results, speaker)
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
             log.warning("memory recall skipped: %s", e)  # answering still works without it
             return []

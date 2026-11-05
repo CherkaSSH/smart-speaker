@@ -6,6 +6,13 @@ States, as on Yandex Station:
   thinking   the brain is working on it; new speech replaces the request
   speaking   playing the answer; new speech or a stop word interrupts
   ringing    a timer or alarm is going off; new speech or a stop word silences it
+
+Voice profiles (speakers.py): every utterance sent to the brain carries
+`"speaker": name` when its audio matches an enrolled voice. The brain's
+`enroll` message makes this service speak three prompts, embed the answers
+and store the profile (enrollment answers bypass the normal command path);
+`forget_voice` deletes one, `voices` lists them. The replies are `enroll_result`
+and `voices`; the protocol is documented at the top of brain/server.py.
 """
 
 from __future__ import annotations
@@ -32,6 +39,8 @@ from .audio import Mic, Player
 from .echo import EchoCanceller, Reference
 from .gate import Gate
 from .music import MusicPlayer
+from .night import Night
+from .speakers import AudioRing, Enrollment, VoiceProfiles, texts as speaker_texts
 from .tts import TTS, normalize
 from .wake import WakeMatcher, phonetic, words
 
@@ -48,6 +57,11 @@ ECHO_TAIL = 0.5  # seconds after our last sound that the mic may still hear it (
 TALK_HOLD = 2.5  # seconds the music stays ducked after the user was last heard over it
 HOLD_PEAK = 0.2  # a file used as waiting music is scaled to this peak: background, under the voice
 HOLD_MAX_SECONDS = 120  # and cut to this length (it loops)
+ENROLL_WAIT = 8.0  # seconds to answer an enrollment prompt before giving up
+ENROLL_ATTEMPTS = 3  # how many times one prompt is repeated
+ENROLL_MIN_SECONDS = 0.6  # answer audio below this is the prompt's echo or a cough
+ENROLL_ECHO_TAIL = 0.15  # audio before the prompt's end plus this is still ours
+ENROLL_TURN_WAIT = 15.0  # how long the "скажи три фразы" answer may take to finish
 
 
 def _hold_audio(cfg: Config, spec: str) -> np.ndarray | None:
@@ -84,9 +98,11 @@ class Voice:
         self.stop_words = {" ".join(words(s)) for s in w["stop_words"]}
         # One record of everything we play, so the mic can subtract it (echo cancellation).
         self.reference = Reference() if cfg["audio"]["echo_cancellation"] else None
-        self.player = Player(cfg["audio"], loop, self.reference)
+        self.night = Night(cfg["audio"])  # quieter answers and music during the configured hours
+        self._night_active = self.night.active()
+        self.player = Player(cfg["audio"], loop, self.reference, night=self.night)
         self.music = MusicPlayer(cfg["audio"], cfg["music"], loop, self.on_music_event, self.reference,
-                                 on_position=self.on_music_position)
+                                 on_position=self.on_music_position, night=self.night)
         self.talk_until = 0.0  # the user is talking over the music until then: keep it ducked
         self._music_start: asyncio.Task | None = None
         a = cfg["asr"]
@@ -100,11 +116,16 @@ class Voice:
         if self.gate:
             for stream in self.streams:
                 stream.active = False
+        self.audio_ring = AudioRing()  # the last seconds of what the mic heard, for speaker recognition
+        self.profiles = VoiceProfiles(cfg)
+        self.enrolling: Enrollment | None = None  # a voice enrollment in progress
+        self.enroll_queue: asyncio.Queue[tuple[str, float, float] | None] = asyncio.Queue()
+        self._enroll_task: asyncio.Task | None = None
         self.mic = Mic(cfg["audio"], loop,
                        [self.gate.audio] if self.gate else [s.audio for s in self.streams],
                        self.streams if self.gate else [],
                        EchoCanceller(self.reference, cfg["audio"]["echo_model"], cfg["audio"]["echo_music_model"])
-                       if self.reference else None)
+                       if self.reference else None, self.audio_ring)
         self.acks = {lang: self.tts.synth(text) for lang, text in cfg["character"]["ack"].items()}
         self.ack_texts = cfg["character"]["ack"]
 
@@ -118,6 +139,7 @@ class Voice:
         self.play_end = 0.0  # estimated end of everything queued for playback
         self.ring_task: asyncio.Task | None = None
         self.waiting: deque[dict] = deque()  # the brain's own messages to say once the speaker is free
+        self.loud_turns: set[str] = set()  # turns the brain marked loud (an alarm): no night cap
         self.ws: aiohttp.ClientWebSocketResponse | None = None
         self.alt_finals: list[Final] = []  # recent finals of the language-detecting stream
         self.ignore_before = 0.0  # audio at or before this time already belongs to an older turn
@@ -169,13 +191,24 @@ class Voice:
         self.music.duck(self.state != "idle" or self.recognition_active or self.player.playing
                         or time.monotonic() < self.talk_until)
 
+    def _apply_night(self) -> None:
+        """The night window opened or closed: re-apply the volume caps."""
+        active = self.night.active()
+        if active != self._night_active:
+            self._night_active = active
+            if active:
+                self.night.free_music = False  # a new night starts capped
+            self.player.refresh_volume()
+            self.music.refresh_volume()
+            log.info("night mode: %s", "on" if active else "off")
+
     def on_user_talking(self) -> None:
         if self.music.state == "playing" and time.monotonic() >= self.talk_until:
             log.info("user talking over the music: ducking")
         self.talk_until = time.monotonic() + TALK_HOLD
         self._update_duck()
 
-    def play(self, audio: np.ndarray, rate: int, text: str = "") -> None:
+    def play(self, audio: np.ndarray, rate: int, text: str = "", loud: bool = False) -> None:
         if not len(audio):
             return
         now = time.monotonic()
@@ -187,7 +220,7 @@ class Voice:
             said = words(text) + words(normalize(text, detect(text)))
             self.spoken.append((start, self.play_end, [phonetic(x) for x in said]))
             self.spoken = [s for s in self.spoken if s[1] > now - 30]
-        self.player.play(audio, rate)
+        self.player.play(audio, rate, loud=loud)
 
     def without_echo(self, f: Final) -> str:
         """The user's part of a transcript.
@@ -250,6 +283,7 @@ class Voice:
             self.ring_task.cancel()
         was_busy = self.state in ("thinking", "speaking")
         self.turn_id = None
+        self.loud_turns.clear()
         self.holding = False
         self.player.stop()
         self.play_end = 0.0
@@ -322,6 +356,11 @@ class Voice:
             return
         self.ignore_before = f.end
         log.info("heard %r (ended %.2fs ago)", f.text, now - f.end)
+        if self.enrolling is not None:
+            # The prompts are what the person is asked to repeat, so echo removal would
+            # eat the answer too: enrollment cuts the prompt's playback off by time instead.
+            self._on_enroll_speech(f)
+            return
         text = self.without_echo(f)
         echo = text != f.text
         if echo:
@@ -339,7 +378,7 @@ class Voice:
                 self.play(ack, self.tts.rate, self.ack_texts.get(lang, ""))
                 self.listen(self.listen_seconds, "wake phrase alone")
             else:
-                await self.utterance(rest, f.end)
+                await self.utterance(rest, f.end, f.start)
             return
         if self.state in ("ringing", "speaking", "thinking") and len(words(text)) <= 4 \
                 and any(self.is_stop(w) for w in words(text)):
@@ -361,13 +400,13 @@ class Voice:
                 # A real user word left after removing our voice is a barge-in, even
                 # without the wake phrase. Pure echo has no words left and returns above.
                 await self.interrupt("user speech")
-            await self.utterance(text, f.end)
+            await self.utterance(text, f.end, f.start)
             return
         log.info("ignored: no wake phrase")
         if self.state == "idle":
             self._set_streams_active(False)  # the small gate opened, but Nemotron rejected it
 
-    async def utterance(self, text: str, ended: float) -> None:
+    async def utterance(self, text: str, ended: float, started: float | None = None) -> None:
         if self.ws is None or self.ws.closed:
             log.error("brain is not connected")
             self.play(self.tts.synth("Мозг не отвечает."), self.tts.rate, "Мозг не отвечает.")
@@ -377,7 +416,32 @@ class Voice:
         self.heard_at = ended
         self.first_audio_pending = True
         self.set_state("thinking", text)
-        await self.send({"type": "utterance", "id": self.turn_id, "text": text, "lang": detect(text)})
+        msg = {"type": "utterance", "id": self.turn_id, "text": text, "lang": detect(text)}
+        speaker = await self.who_is(started, ended) if started is not None else None
+        if speaker:
+            msg["speaker"] = speaker
+        await self.send(msg)
+
+    async def who_is(self, started: float, ended: float) -> str | None:
+        """Name of the enrolled person who said [started, ended], or None.
+
+        The embedding runs in a worker thread (12 ms for a 2 s clip), after the
+        state is already set: the turn waits only for this and the ASR round trip.
+        """
+        if not self.profiles.available or not self.profiles.voices:
+            return None
+        clip = self.audio_ring.audio(started, ended)
+        if len(clip) < self.profiles.min_seconds * self.audio_ring.rate:
+            log.info("voice not recognised: only %.2fs of audio", len(clip) / self.audio_ring.rate)
+            return None
+        t0 = time.monotonic()
+        try:
+            hit = await asyncio.to_thread(self.profiles.identify, clip)
+        except Exception:
+            log.exception("speaker recognition failed")
+            return None
+        log.info("speaker check: %.0f ms", 1000 * (time.monotonic() - t0))
+        return hit[0] if hit else None
 
     # Brain events ------------------------------------------------------------
     async def on_brain(self, msg: dict) -> None:
@@ -385,7 +449,19 @@ class Voice:
         if kind == "volume":
             self.player.set_volume(int(msg["level"]))
             self.music.set_volume(int(msg["level"]))
+            if msg.get("user") and self.night.active():
+                # The user asked for this volume at night: music plays at it, the answers stay capped.
+                self.night.free_music = True
+                self.music.refresh_volume()
             log.info("volume %s", msg["level"])
+        elif kind == "night":
+            self.night.override = msg.get("on")
+            if self.night.override:
+                self.night.free_music = False  # a night turned on by hand starts capped
+            self._apply_night()
+            self.player.refresh_volume()
+            self.music.refresh_volume()
+            log.info("night mode: %s", {True: "on", False: "off", None: "by the clock"}[self.night.override])
         elif kind == "music":
             await self.on_music_command(msg)
         elif kind == "say" and msg.get("id") == self.turn_id:
@@ -402,19 +478,140 @@ class Voice:
                 self.waiting.append(msg)  # said once the user is done with the speaker
             else:
                 log.info("not saying %r: %s", " ".join(msg["sentences"]), self.state)
+        elif kind == "enroll":  # the brain asked for a profile: the prompts are spoken here
+            if self._enroll_task and not self._enroll_task.done():
+                self._enroll_task.cancel()
+            self._enroll_task = asyncio.create_task(self.enroll_voice(msg))
+        elif kind == "forget_voice":
+            name = str(msg.get("name") or "")
+            log.info("forget voice %r: %s", name, "removed" if self.profiles.forget(name) else "not found")
+            await self.send({"type": "voices", "names": self.profiles.names()})
+        elif kind == "voices":  # the brain asks which profiles exist
+            await self.send({"type": "voices", "names": self.profiles.names()})
 
     def announce(self, msg: dict) -> None:
         self.turn_id = msg["id"]
+        if msg.get("loud"):
+            self.loud_turns.add(msg["id"])  # an alarm's line: not quieted at night
         for sentence in msg["sentences"]:
             self.speech.put_nowait((msg["id"], sentence, False))
         self.speech.put_nowait((msg["id"], None, bool(msg.get("expect_reply"))))
+
+    # Voice profiles ----------------------------------------------------------
+    # The brain decides *whose* profile and handles the talking around it; the
+    # service owns the audio: it speaks the prompts, takes the answers from the
+    # microphone, averages their embeddings and stores the profile.
+    def _on_enroll_speech(self, f: Final) -> None:
+        """Speech heard while a profile is being recorded: one sample, or a stop."""
+        if self.is_stop(f.text) or self.wake.find(f.text):
+            self.enrolling.aborted = "stopped"
+            self._enroll_put(None)
+            return
+        # The person repeats the prompt, so early audio is the prompt's own echo.
+        start = max(f.start, self.enrolling.prompt_end)
+        if f.end - start < ENROLL_MIN_SECONDS:
+            log.info("enrollment: ignoring speech over the prompt %r", f.text)
+            return
+        self._enroll_put((f.text, start, f.end))
+
+    def _enroll_put(self, item: tuple[str, float, float] | None) -> None:
+        if self.enroll_queue.full():
+            try:
+                self.enroll_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        self.enroll_queue.put_nowait(item)
+
+    async def _enroll_wait(self, timeout: float) -> tuple[str, float, float] | None:
+        try:
+            return await asyncio.wait_for(self.enroll_queue.get(), timeout)
+        except TimeoutError:
+            return None
+
+    async def _enroll_say(self, text: str) -> None:
+        audio = await asyncio.to_thread(self.tts.synth, text)
+        self.play(audio, self.tts.rate, text)
+        log.info("say: %s", text)
+
+    async def _enroll_prompt(self, prompt: str, t: dict) -> np.ndarray | None:
+        """Say one prompt and return the embedding of the answer; None if stopped or unheard."""
+        for attempt in range(ENROLL_ATTEMPTS):
+            said = prompt if attempt == 0 else f"{t['repeat']} {prompt}"
+            await self._enroll_say(said)
+            if self.enrolling is None:
+                return None
+            self.enrolling.prompt_end = self.play_end + ENROLL_ECHO_TAIL
+            while time.monotonic() < self.play_end:
+                await asyncio.sleep(0.05)
+            if self.enrolling is None or self.enrolling.aborted:
+                return None
+            item = await self._enroll_wait(ENROLL_WAIT)
+            if item is None:
+                self.enrolling.aborted = self.enrolling.aborted or "timeout"
+                return None
+            _, start, end = item
+            clip = self.audio_ring.audio(start, end, pad=0.0)
+            vector = await asyncio.to_thread(self.profiles.embed, clip)
+            if vector is not None:
+                return vector
+            log.info("enrollment: only %.2fs of usable audio, asking again", len(clip) / self.audio_ring.rate)
+        self.enrolling.aborted = self.enrolling.aborted or "timeout"
+        return None
+
+    async def enroll_voice(self, msg: dict) -> None:
+        lang = msg.get("lang") if msg.get("lang") in ("ru", "en") else "ru"
+        t = speaker_texts(lang)
+        name = str(msg.get("name") or "").strip()
+        result = {"type": "enroll_result", "id": msg.get("id"), "name": name, "ok": False}
+        if not name:
+            result["error"] = "no name"
+            await self.send(result)
+            return
+        if not self.profiles.available:
+            log.warning("enrollment for %r: no speaker model", name)
+            await self._enroll_say(t["unavailable"])
+            result["error"] = "unavailable"
+            await self.send(result)
+            return
+        # The answer that promised the enrollment ("скажи три фразы") is still playing.
+        deadline = time.monotonic() + ENROLL_TURN_WAIT
+        while (self.turn_id is not None or time.monotonic() < self.play_end) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        while not self.enroll_queue.empty():
+            self.enroll_queue.get_nowait()
+        log.info("enrolling voice %r (%s)", name, lang)
+        self.enrolling = Enrollment(lang)
+        self.listen_until = time.monotonic() + 3600  # only the prompts below end the enrollment
+        self.set_state("listening", "voice enrollment")
+        samples: list[np.ndarray] = []
+        aborted = ""
+        try:
+            for prompt in t["prompts"]:
+                vector = await self._enroll_prompt(prompt, t)
+                if vector is None:
+                    break
+                samples.append(vector)
+            aborted = self.enrolling.aborted if self.enrolling else "stopped"
+        finally:
+            aborted = aborted or (self.enrolling.aborted if self.enrolling else "")
+            self.enrolling = None
+            self.set_state("idle", "voice enrollment")
+        if len(samples) == len(t["prompts"]) and await asyncio.to_thread(self.profiles.enroll, name, samples):
+            result["ok"] = True
+            await self._enroll_say(t["done"])
+        else:
+            result["error"] = aborted or "not enough samples"
+            await self._enroll_say(t["stopped"] if aborted == "stopped" else t["timeout"])
+        log.info("enrollment of %r: %s", name, "done" if result["ok"] else result.get("error"))
+        await self.send(result)
+        await self.send({"type": "voices", "names": self.profiles.names()})
 
     async def on_music_command(self, msg: dict) -> None:
         action = msg["action"]
         if self._music_start and not self._music_start.done():
             self._music_start.cancel()  # a newer command wins over a track still waiting to start
         if action == "play":
-            self._music_start = asyncio.create_task(self._start_music(msg["track"]))
+            self._music_start = asyncio.create_task(self._start_music(msg["track"], bool(msg.get("alarm"))))
         elif action == "pause":
             self.music.pause()
         elif action == "resume":
@@ -423,13 +620,13 @@ class Voice:
             self.music.stop()
         self._update_duck()
 
-    async def _start_music(self, track: dict) -> None:
+    async def _start_music(self, track: dict, alarm: bool = False) -> None:
         # Let the answer ("Включаю ...") finish before the song starts.
         deadline = time.monotonic() + 15
         await asyncio.sleep(0.3)
         while (self.turn_id is not None or self.player.playing) and time.monotonic() < deadline:
             await asyncio.sleep(0.1)
-        self.music.play(track)
+        self.music.play(track, alarm=alarm)
         self._update_duck()
 
     async def on_music_event(self, event: str, track: dict, detail: str) -> None:
@@ -446,6 +643,8 @@ class Voice:
         while True:
             turn, text, expect_reply = await self.speech.get()
             if turn != self.turn_id:
+                if turn is not None:
+                    self.loud_turns.discard(turn)
                 continue
             if text is None:  # end of the answer: wait for it to finish playing
                 self._stop_hold()
@@ -453,6 +652,7 @@ class Voice:
                 if turn != self.turn_id:
                     continue
                 self.turn_id = None
+                self.loud_turns.discard(turn)
                 if expect_reply:
                     self.play(sounds.listen_start(), sounds.RATE)
                     self.listen(self.follow_up_seconds, "answer was a question")
@@ -466,7 +666,7 @@ class Voice:
                 continue
             self.set_state("speaking")
             self._stop_hold()
-            self.play(audio, self.tts.rate, text)
+            self.play(audio, self.tts.rate, text, loud=turn in self.loud_turns)
             if self.first_audio_pending:
                 self.first_audio_pending = False
                 log.info("first audio %.2fs after the user stopped speaking (TTS %.2fs)",
@@ -479,8 +679,8 @@ class Voice:
         try:
             deadline = time.monotonic() + RING_SECONDS
             while time.monotonic() < deadline:
-                self.play(sounds.ring(), sounds.RATE)
-                self.play(audio, self.tts.rate, text)
+                self.play(sounds.ring(), sounds.RATE, loud=True)  # an alarm is never quieted at night
+                self.play(audio, self.tts.rate, text, loud=True)
                 await self.player.wait_idle()
             self.set_state("idle", "ring timed out")
         except asyncio.CancelledError:
@@ -493,9 +693,11 @@ class Voice:
         """Close the listening window when nobody speaks."""
         while True:
             await asyncio.sleep(0.2)
+            self._apply_night()  # the configured night window may have opened or closed
             self._update_duck()  # speech playback and the talk hold end on their own
             self._hold_tick()
-            if self.state == "listening" and time.monotonic() > self.listen_until and not self.player.playing:
+            if self.state == "listening" and self.enrolling is None \
+                    and time.monotonic() > self.listen_until and not self.player.playing:
                 self.play(sounds.listen_end(), sounds.RATE)
                 self.set_state("idle", "nobody spoke")
             elif self.state == "idle" and self.recognition_active \

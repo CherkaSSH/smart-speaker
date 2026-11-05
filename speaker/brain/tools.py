@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 
 from . import speech
+from .timers import next_due, normalize_repeat, repeat_days
 
 if TYPE_CHECKING:
     from .server import Brain
@@ -28,12 +29,16 @@ SCHEMAS = [
         {"seconds": {"type": "integer", "description": "Length in seconds"},
          "label": {"type": "string", "description": "What it is for, e.g. 'пельмени'. Optional."}},
         ["seconds"]),
-    _fn("set_alarm", "Set an alarm clock for a time of day.",
+    _fn("set_alarm", "Set an alarm clock for a time of day. For repeating alarms («по будням», «каждый день», "
+        "«по выходным», «каждый понедельник») pass repeat; also use it for repeating reminders like "
+        "«каждый понедельник в 9 напоминай про спортзал» (label + repeat).",
         {"time": {"type": "string", "description": "24-hour HH:MM"},
          "date": {"type": "string", "description": "YYYY-MM-DD; omit for the next occurrence of that time"},
          "label": {"type": "string"},
          "music": {"type": "string", "description": "Wake up to this music: an artist or song as the user said it, "
-                                                    "empty for any music. Omit for an alarm that only rings"}},
+                                                    "empty for any music. Omit for an alarm that only rings"},
+         "repeat": {"type": "string", "description": "Repeat rule: 'daily', 'weekdays', 'weekends' or weekdays "
+                                                    "like 'mon,wed,fri'; omit for a one-off alarm"}},
         ["time"]),
     _fn("set_sleep_timer", "Stop the music after a while. Use for 'turn off the music in 30 minutes' and sleep timers.",
         {"seconds": {"type": "integer", "description": "Length in seconds"}}, ["seconds"]),
@@ -163,24 +168,33 @@ class Tools:
         seconds = int(seconds)
         if seconds <= 0:
             return {"error": "seconds must be positive"}
-        item = self.brain.scheduler.add("timer", time.time() + seconds, self.lang, label, seconds)
+        item = self.brain.scheduler.add("timer", time.time() + seconds, self.lang, label, seconds,
+                                        who=self.brain.speaker)
         return {"ok": True, "timer_id": item.id, "length": speech.duration(seconds, self.lang), "label": item.label}
 
-    async def t_set_alarm(self, time: str, date: str = "", label: str = "", music: str | None = None) -> dict:
+    async def t_set_alarm(self, time: str, date: str = "", label: str = "", music: str | None = None,
+                          repeat: str | None = None) -> dict:
         hh, mm = (int(x) for x in time.strip().split(":")[:2])
         now = dt.datetime.now()
-        if date:
+        rule = normalize_repeat(repeat)
+        if repeat and not rule:
+            return {"error": f"unknown repeat rule {repeat!r}: use daily, weekdays, weekends or days like 'mon,wed'"}
+        if date and not rule:
             when = dt.datetime.combine(dt.date.fromisoformat(date), dt.time(hh, mm))
         else:
             when = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if when <= now:
                 when += dt.timedelta(days=1)
+        if rule:  # the next occurrence of that time on one of the allowed weekdays
+            when = dt.datetime.fromtimestamp(next_due(when.timestamp(), rule, now.timestamp()))
         if when <= now:
             return {"error": "that time has passed"}
-        item = self.brain.scheduler.add("alarm", when.timestamp(), self.lang, label, music=music)
+        item = self.brain.scheduler.add("alarm", when.timestamp(), self.lang, label, music=music,
+                                        repeat=rule or None, who=self.brain.speaker)
         return {"ok": True, "alarm_id": item.id, "rings_at": when.strftime("%Y-%m-%d %H:%M"),
                 "in": speech.duration(int((when - now).total_seconds()) // 60 * 60, self.lang),
-                **({"music": item.music} if item.music is not None else {})}
+                **({"music": item.music} if item.music is not None else {}),
+                **({"repeat": item.repeat} if item.repeat else {})}
 
     async def t_set_sleep_timer(self, seconds: int) -> dict:
         seconds = int(seconds)
@@ -194,7 +208,8 @@ class Tools:
         items = self.brain.scheduler.pending()
         return {"items": [{"kind": i.kind, "label": i.label, "left": speech.duration(i.remaining(), self.lang),
                            "at": dt.datetime.fromtimestamp(i.due).strftime("%H:%M"),
-                           **({"music": i.music} if i.music is not None else {})} for i in items]}
+                           **({"music": i.music} if i.music is not None else {}),
+                           **({"repeat": i.repeat} if i.repeat else {})} for i in items]}
 
     async def t_cancel_timers(self, which: str = "all") -> dict:
         which = which.strip().lower()
@@ -297,16 +312,16 @@ class Tools:
 
     # Memory and escalation ----------------------------------------------
     async def t_save_memory(self, text: str) -> dict:
-        return await self.brain.memory.save(text)
+        return await self.brain.memory.save(text, self.brain.speaker)
 
     async def t_search_memory(self, query: str, limit: int = 5) -> dict:
-        return {"items": await self.brain.memory.search(query, limit)}
+        return {"items": await self.brain.memory.search(query, limit, self.brain.speaker)}
 
     async def t_ask_big_model(self, question: str) -> dict:
         if not self.brain.remote or not self.brain.remote.configured:
             return {"error": "the big model is not configured"}
         messages = [{"role": "system", "content": self.brain.remote_system},
-                    {"role": "user", "content": f"{self.brain._stamp(self.lang)} {question}"}]
+                    {"role": "user", "content": f"{self.brain._stamp(self.lang, self.brain.speaker)} {question}"}]
         answer = [sentence async for sentence in self.brain.remote.respond(messages)]
         return {"answer": " ".join(answer)}
 

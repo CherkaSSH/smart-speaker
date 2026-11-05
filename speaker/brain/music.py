@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -29,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
+from urllib.parse import quote
 
 import aiohttp
 from yandex_music import ClientAsync
@@ -202,24 +204,145 @@ class LocalLibrary:
 
 
 class Radio:
-    """Internet radio stations from config: {name = url}. Any HTTP/HLS stream works."""
+    """Internet radio: the stations from `[music] radio` ({name = url}, any HTTP/HLS stream), plus the
+    open radio-browser.info directory when `[music] radio_directory` is on. Configured stations answer
+    first and need no network: they are the owner's picks. Then the directory is searched by name and
+    by tag («радио jazz», genres are tagged in English), which finds brand stations by their names in
+    any spelling — «европа плюс» ↔ "Europa Plus". Results are ranked by name match, a working check,
+    votes and clicks, a playable codec, and a Russian station for a Russian request. The server is
+    discovered once from all.api.radio-browser.info; a dead one is skipped, and as the API asks, a
+    click is registered when a directory station starts."""
 
     name = "radio"
+    SERVERS = "https://all.api.radio-browser.info/json/servers"
+    ALIAS = "https://all.api.radio-browser.info"  # a DNS round-robin of the servers, used when the list fails
+    USER_AGENT = "smart-speaker/0.1"
+    TIMEOUT = 2.0  # seconds per request: a radio command must answer in a second or two
+    BUDGET = 5.0  # seconds for one lookup, all retries included
+    CACHE_TTL = 600
+    RESULTS = 30  # stations fetched per search; the best few are kept
 
-    def __init__(self, stations: dict[str, str]):
+    def __init__(self, stations: dict[str, str], directory: bool = False):
         self.stations = stations
+        self.directory = directory
+        self._servers: list[str] = []  # API base URLs, the last good one first
+        self._cache: dict[str, tuple[float, list[Track]]] = {}
+        self._uuid: dict[str, str] = {}  # stream URL -> station uuid, for the click
+        self._clicks: set[asyncio.Task] = set()
 
     async def search(self, query: str, limit: int) -> list[Track]:
         return []  # only answers radio requests
 
-    async def radio(self, query: str, limit: int) -> list[Track]:
-        q = re.sub(r"\b(радио|radio|станци\w*|station)\b", " ", query.lower()).strip()
+    def _configured(self, q: str) -> list[Track]:
         ranked = sorted(((_station_score(q, name, "") if q else 1.0, name) for name in self.stations),
                         key=lambda x: -x[0])
-        return [Track(self.name, name, name, live=True) for s, name in ranked if s >= MATCH_THRESHOLD][:limit]
+        return [Track(self.name, name, name, live=True) for s, name in ranked if s >= MATCH_THRESHOLD]
+
+    async def radio(self, query: str, limit: int) -> list[Track]:
+        q = re.sub(r"\b(радио|radio|станци\w*|station)\b", " ", query.lower()).strip()
+        configured = self._configured(q)
+        if configured or not q or not self.directory:
+            return configured[:limit]
+        return (await self._directory(q))[:limit]
 
     async def resolve(self, track: Track) -> str:
-        return self.stations[track.id]
+        if track.id in self.stations:  # a configured station, named by its id
+            return self.stations[track.id]
+        uuid = self._uuid.get(track.id)
+        if uuid:  # the directory asks for this when a station starts
+            task = asyncio.create_task(self._get(f"/json/url/{uuid}"))
+            self._clicks.add(task)
+            task.add_done_callback(self._clicks.discard)
+        return track.id
+
+    async def _directory(self, q: str) -> list[Track]:
+        cached = self._cache.get(q)
+        if cached and time.monotonic() - cached[0] < self.CACHE_TTL:
+            return cached[1]
+        params = {"hidebroken": "true", "order": "clickcount", "reverse": "true", "limit": str(self.RESULTS)}
+        searches = [self._get("/json/stations/search", {**params, "name": q})]
+        if re.fullmatch(r"[a-z0-9 -]{2,}", q):  # tags are English words: «jazz», «deep house»
+            searches.append(self._get(f"/json/stations/bytag/{quote(q)}", params))
+        found = [s for batch in await asyncio.gather(*searches) for s in batch]
+        tracks = self._best(found, q)
+        self._cache[q] = (time.monotonic(), tracks)
+        return tracks
+
+    def _best(self, stations: list[dict], q: str) -> list[Track]:
+        """The best stations for `q`, best first: a good name wins (a brand beats its regional and
+        sub-channel namesakes), then a checked, popular one in a codec ffmpeg certainly plays, a
+        Russian one for a Russian request."""
+        prefer_ru = bool(re.search(r"[а-яё]", q))
+        words = len(_fold(q).split())
+        scored, seen = [], set()
+        for s in stations:
+            name = (s.get("name") or "").strip()
+            url = s.get("url_resolved") or s.get("url") or ""
+            if not name or not url or url in seen:
+                continue
+            seen.add(url)
+            match = _station_score(q, name, (s.get("tags") or "").replace(",", " "))
+            if match < MATCH_THRESHOLD:  # a tag search returns plenty of unrelated stations
+                continue
+            codec = (s.get("codec") or "").lower()
+            rank = match - 0.01 * max(0, len(_fold(name).split()) - words)  # «Радио Максимум» over «Самара-Максимум»
+            rank += 0.05 if s.get("lastcheckok") == 1 else -0.05
+            rank += 0.01 * math.log1p(s.get("votes") or 0) + 0.005 * math.log1p(s.get("clickcount") or 0)
+            rank += 0.03 if codec in ("mp3", "aac", "aac+") else (-0.05 if codec in ("", "unknown") else 0.0)
+            if prefer_ru and (s.get("countrycode") or "").upper() == "RU":
+                rank += 0.08
+            scored.append((rank, name, url, s.get("stationuuid") or ""))
+        scored.sort(key=lambda x: -x[0])
+        tracks = []
+        for _, name, url, uuid in scored[:self.RESULTS]:
+            if uuid:
+                self._uuid[url] = uuid
+            tracks.append(Track(self.name, url, name, live=True))
+        return tracks
+
+    async def _get(self, path: str, params: dict | None = None) -> list[dict]:
+        """JSON from the directory, the last good server first; on failure another server, then the DNS
+        alias (the same list would hand the failed one back). [] when all fail."""
+        deadline = time.monotonic() + self.BUDGET  # a voice command must not hang
+        tried: set[str] = set()
+        while time.monotonic() <= deadline:
+            if not self._servers:
+                self._servers = await self._discover() or [self.ALIAS]
+            base = next((b for b in self._servers if b not in tried), None)
+            if base is None:
+                if self.ALIAS in tried:
+                    return []
+                base = self.ALIAS  # a DNS round-robin of the servers: usually not the one that just failed
+            tried.add(base)
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.TIMEOUT)) as http:
+                    async with http.get(base + path, params=params or {},
+                                        headers={"User-Agent": self.USER_AGENT}) as r:
+                        if r.status >= 500:
+                            r.raise_for_status()
+                        # A 4xx means no results (an unused tag), not a broken server.
+                        data = await r.json(content_type=None) if r.status == 200 else []
+                if base in self._servers:
+                    self._servers.remove(base)
+                self._servers.insert(0, base)
+                return data if isinstance(data, list) else []
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+                log.info("radio-browser %s: %r", base, e)
+                if base in self._servers:
+                    self._servers.remove(base)
+        return []
+
+    async def _discover(self) -> list[str]:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.TIMEOUT)) as http:
+                async with http.get(self.SERVERS, headers={"User-Agent": self.USER_AGENT}) as r:
+                    r.raise_for_status()
+                    hosts = await r.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            log.info("radio-browser: no server list (%r): using the DNS alias", e)
+            return []
+        names = (h.get("name") for h in hosts if isinstance(h, dict) and h.get("name"))
+        return [f"https://{name}" for name in dict.fromkeys(names)]
 
 
 class Navidrome:
@@ -286,7 +409,8 @@ class Navidrome:
 # types (Техно is a genre and a mix); the first type in this order keeps the name.
 STATION_TYPES = ("genre", "mood", "activity", "epoch", "local-language", "personal", "micro-genre", "editorial",
                  "tempo")
-STATION_MATCH = 0.8  # stricter than songs: 600 names match almost anything loosely («groove salad» → Грув-метал)
+STATION_MATCH = 0.98  # a wave must be named outright: fuzzily «рекорд» is «Рэпкор» (0.85), and a named
+# station belongs to the radio directory instead
 MY_WAVE = "Моя волна"
 _DECADES = {"пятидесят": "1950", "шестидесят": "1960", "семидесят": "1970", "восьмидесят": "1980",
             "девяност": "1990", "нулев": "2000", "двухтысячн": "2000"}
@@ -474,7 +598,9 @@ class YandexMusic:
         return found
 
     async def radio(self, query: str, limit: int) -> list[Track]:
-        """«радио рок», «спокойное», «для тренировки», «90-х»; «радио» or «моя волна» alone is My Wave."""
+        """«радио рок», «спокойное», «для тренировки», «90-х»; «радио» or «моя волна» alone is My Wave.
+        Only a wave named outright answers (see STATION_MATCH): anything else falls through to the
+        radio directory instead of playing a vaguely similar wave."""
         if not (await self._api()).token:
             return []
         stations = await self.stations()
@@ -583,7 +709,8 @@ async def yandex_login(token_file: Path) -> None:
 class Music:
     def __init__(self, brain: "Brain", cfg: dict, library: Path):
         self.brain = brain
-        make = {"local": lambda: LocalLibrary(library), "radio": lambda: Radio(dict(cfg.get("radio", {}))),
+        make = {"local": lambda: LocalLibrary(library),
+                "radio": lambda: Radio(dict(cfg.get("radio", {})), bool(cfg.get("radio_directory", True))),
                 "navidrome": lambda: Navidrome(dict(cfg["navidrome"])),
                 "yandex": lambda: YandexMusic(dict(cfg["yandex"]), brain.cfg.file(cfg["yandex"]["token_file"]))}
         books_cfg = cfg.get("books") or {}
@@ -605,6 +732,7 @@ class Music:
         self.requested = False  # the queue is songs the user named: when they run out, after_request decides
         self.lang = "ru"  # of the request that started the queue, for «Включить мою волну?»
         self.repeat = False  # play the current track again when it ends, until told otherwise
+        self.alarm = False  # the music is an alarm: the voice service never quiets it at night
         self.announce = bool(cfg.get("announce", False))  # say «Дальше: …» before each next track
         self._playing: tuple[Track, float] | None = None  # the started track and when, for feedback
         self._progress: tuple[str, float, float] | None = None  # track id, seconds, when that was true
@@ -691,11 +819,13 @@ class Music:
                 return tracks
         return await self._more([after])
 
-    async def play(self, query: str = "", radio: bool = False, lang: str = "ru") -> Track | None:
+    async def play(self, query: str = "", radio: bool = False, lang: str = "ru",
+                   alarm: bool = False) -> Track | None:
         tracks = await self.find(query, radio)
         if not tracks:
             return None
         self.lang = lang
+        self.alarm = alarm
         return await self._replace_queue(tracks, requested=bool(query) and not radio and not tracks[0].station)
 
     async def play_book(self, query: str = "", lang: str = "ru", resume: bool = False) -> Track | None:
@@ -841,7 +971,8 @@ class Music:
                 ru = self.lang == "ru"
                 await self.brain.speak(f"Дальше: {track.label('ru')}." if ru else f"Next: {track.label('en')}.",
                                        self.lang, queue=False)
-            await self.brain.broadcast({"type": "music", "action": "play", "track": asdict(track)})
+            await self.brain.broadcast({"type": "music", "action": "play", "track": asdict(track),
+                                        "alarm": self.alarm})
             self._progress = (track.id, track.start, time.monotonic())
             if track.provider == "books" and self.books is not None:
                 uuid, _, chapter = track.id.rpartition(":")

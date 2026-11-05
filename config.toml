@@ -60,6 +60,15 @@ output_channels = [0, 1]
 mic_gain = 4.0
 # Initial volume 0..10, like Yandex Station. Changed by voice later.
 volume = 6
+# Night mode, like Alice's: between night_start and night_end (local HH:MM; the
+# window may run past midnight) answers and chimes play at no more than
+# night_volume (0..10) even when the volume is higher. Music is quieted too,
+# unless you set the volume yourself during the night. Alarms and reminders
+# always ring at full volume. An empty or equal start and end turns it off;
+# «включи ночной режим»/«выключи ночной режим» override the clock until restart.
+night_start = "23:00"
+night_end = "08:00"
+night_volume = 2
 # Subtract what the speaker plays (answers, music) from the mic with LocalVQE,
 # a small neural echo canceller, so the wake word and commands are heard over
 # it. Needs the speaker and mic on one sound card (one clock).
@@ -78,8 +87,9 @@ library = "music"
 # Where music comes from. A request plays from the first provider here that
 # finds something: "local" = the library, "navidrome" and "yandex" = the
 # streaming services below. Radio requests go to Yandex's waves (genre, mood,
-# decade: «включи радио рок») and "radio", the internet stations below. With
-# "yandex" first, «включи музыку» and «включи радио» play My Wave.
+# decade: «включи радио рок») and "radio": the stations below plus the open
+# radio-browser.info directory. With "yandex" first, «включи музыку» and
+# «включи радио» play My Wave.
 providers = ["local", "radio"]
 # When the songs you asked for by name end: "ask" («Включить мою волну?»;
 # «да» starts it), "continue" (start it without asking) or "stop". It is My
@@ -95,7 +105,16 @@ duck_volume = 0.2
 # You are talking over the music when the mic is this many times louder than
 # the music alone would make it (2.0 = 6 dB).
 talk_factor = 2.0
+# Internet radio stations by name: { "Name" = "stream URL" }, any HTTP/HLS
+# stream ffmpeg can open. «включи радио секрет эйджент» plays one by name.
 radio = { "Groove Salad" = "https://ice1.somafm.com/groovesalad-128-mp3", "Secret Agent" = "https://ice1.somafm.com/secretagent-128-mp3" }
+# Search the open radio-browser.info directory (no key or account) when a
+# radio request names a station the list above does not have: «включи радио
+# европа плюс», «включи радио максимум», «включи радио джаз». Stations above
+# win when they match. A request naming one of Yandex's own waves outright
+# («включи радио рок») plays the wave when "yandex" comes first in providers,
+# otherwise a directory station.
+radio_directory = true
 # A Navidrome (or other Subsonic) server; the password is read from the
 # environment variable named here.
 navidrome = { url = "http://127.0.0.1:4533", user = "speaker", password_env = "NAVIDROME_PASSWORD" }
@@ -241,6 +260,10 @@ port = 8770
 fast_commands = true
 # Weather location used when none is named (Open-Meteo, no API key).
 home_city = "Москва"
+# How long to remember the last exchanges for follow-ups like «а завтра?» after
+# «какая погода?». Up to four exchanges per recognised speaker (unknown voices
+# share one); silence longer than this forgets them. 0 = no conversation history.
+history_minutes = 4
 state_file = "state/brain.json"
 
 [voice]
@@ -256,3 +279,22 @@ hold_music_after = 2.5
 # "builtin" (a soft bell loop), or an audio file of your own (any format
 # ffmpeg reads; the first two minutes loop, scaled under the voice).
 hold_music = "builtin"
+
+[speakers]
+# Who is talking: a local speaker-embedding model (3D-Speaker CAM++, ONNX via
+# sherpa-onnx) compares each command with the voices enrolled by «запомни мой
+# голос». The model file is downloaded separately (see README, Voice profiles);
+# without it the speaker simply doesn't recognise anyone.
+enabled = true
+model = "models/spk/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+# Cosine similarity above which an utterance counts as an enrolled person.
+# Silero TTS voices here score 0.71+ for the right person (0.66+ with noise) and
+# at most 0.51 (0.56) for the others; real people sound closer to each other,
+# so lower it if you are not recognised, raise it if strangers are taken for you.
+threshold = 0.6
+# CPU threads for the embedding: 12 ms for a 2 s utterance with 4 here.
+threads = 4
+# Enrolled profiles: names and 192-unit vectors. They never leave this machine.
+state_file = "state/voices.json"
+# Shorter commands have too little speech to identify anyone.
+min_seconds = 0.6

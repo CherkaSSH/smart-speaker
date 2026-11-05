@@ -15,6 +15,7 @@ import soxr
 
 if TYPE_CHECKING:
     from .echo import EchoCanceller, Reference
+    from .speakers import AudioRing
 
 log = logging.getLogger("voice.audio")
 
@@ -88,7 +89,8 @@ class Mic:
     """Pushes (capture_time, pcm16 bytes) chunks of ~100 ms at 16 kHz into asyncio queues."""
 
     def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop, queues: list[asyncio.Queue],
-                 gated_streams: list | None = None, echo: "EchoCanceller | None" = None):
+                 gated_streams: list | None = None, echo: "EchoCanceller | None" = None,
+                 ring: "AudioRing | None" = None):
         self.rate = int(cfg["input_rate"])
         self.gain = float(cfg["mic_gain"])
         self.device = find_device(cfg["input_device"], "input")
@@ -98,6 +100,7 @@ class Mic:
         self.gated_streams = gated_streams or []
         self._loop = loop
         self.echo = echo  # removes our own speech and music from the mic signal
+        self.ring = ring  # keeps the last seconds of what was heard, for speaker recognition
         self._timed = TimedResampler(self.rate)
         self._stream = sd.InputStream(device=self.device, samplerate=self.rate, channels=self.channels,
                                       dtype="float32", blocksize=self.rate // 10, callback=self._callback)
@@ -118,6 +121,8 @@ class Mic:
             pass
 
     def _push(self, item: tuple[float, bytes]) -> None:
+        if self.ring is not None:
+            self.ring.add(*item)  # before the queues: an ASR final may read the span at once
         for q in self.queues:
             if q.full():  # consumer is down: keep the newest audio
                 q.get_nowait()
@@ -141,16 +146,19 @@ class Mic:
 class Player:
     """Plays queued clips; `stop()` silences instantly. Remembers when it last made sound."""
 
-    def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop, reference: "Reference | None" = None):
+    def __init__(self, cfg: dict, loop: asyncio.AbstractEventLoop, reference: "Reference | None" = None,
+                 night=None):
         self.reference = reference  # what we play, for echo cancellation
+        self.night = night  # caps the volume at night; None = never
         self.rate = int(cfg["sample_rate"])
         self.device = find_device(cfg["output_device"], "output")
         info = sd.query_devices(self.device, "output")
         self.channels = min(2, int(info["max_output_channels"]))
         self.out_channels = [c for c in cfg["output_channels"] if c < self.channels] or [0]
-        self.gain = volume_gain(int(cfg["volume"]))
+        self.level = int(cfg["volume"])  # what the brain set, before the night cap
+        self._set_gains()
         self.last_sound = 0.0  # monotonic time the last non-silent block was played
-        self._clips: deque[np.ndarray] = deque()
+        self._clips: deque[tuple[np.ndarray, bool]] = deque()  # (audio, loud)
         self._pos = 0
         self._lock = threading.Lock()
         self._loop = loop
@@ -163,16 +171,27 @@ class Player:
         self._stream: sd.OutputStream | None = None
 
     def set_volume(self, level: int) -> None:
-        self.gain = volume_gain(level)
+        """The volume the brain set; the night mode may cap it."""
+        self.level = int(level)
+        self._set_gains()
+
+    def refresh_volume(self) -> None:
+        """Re-apply the night cap when the window opens or closes."""
+        self._set_gains()
+
+    def _set_gains(self) -> None:
+        self.loud_gain = volume_gain(self.level)  # alarms and reminders ignore the night cap
+        self.gain = volume_gain(self.night.level(self.level) if self.night is not None else self.level)
 
     def _callback(self, out, frames, t, status) -> None:
         out.fill(0)
         written = 0
         with self._lock:
             while written < frames and self._clips:
-                clip = self._clips[0]
+                clip, loud = self._clips[0]
                 n = min(frames - written, len(clip) - self._pos)
-                out[written:written + n, self.out_channels] = (clip[self._pos:self._pos + n] * self.gain)[:, None]
+                out[written:written + n, self.out_channels] = \
+                    (clip[self._pos:self._pos + n] * (self.loud_gain if loud else self.gain))[:, None]
                 written += n
                 self._pos += n
                 if self._pos >= len(clip):
@@ -213,11 +232,11 @@ class Player:
             self._stream.close()
             self._stream = None
 
-    def play(self, audio: np.ndarray, rate: int) -> None:
+    def play(self, audio: np.ndarray, rate: int, loud: bool = False) -> None:
         if rate != self.rate:
             audio = soxr.resample(audio, rate, self.rate)
         with self._lock:
-            self._clips.append(audio.astype(np.float32))
+            self._clips.append((audio.astype(np.float32), loud))
             self._idle.clear()
         if self._pause_timer:
             self._pause_timer.cancel()

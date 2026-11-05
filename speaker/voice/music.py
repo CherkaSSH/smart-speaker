@@ -32,13 +32,16 @@ DUCK_RAMP = 0.15  # seconds to fade between full and ducked volume
 class MusicPlayer:
     def __init__(self, audio_cfg: dict, music_cfg: dict, loop: asyncio.AbstractEventLoop,
                  on_event: Callable[[str, dict, str], Awaitable[None]], reference=None,
-                 on_position: Callable[[dict, float], Awaitable[None]] | None = None):
+                 on_position: Callable[[dict, float], Awaitable[None]] | None = None, night=None):
         self.reference = reference  # what we play, for echo cancellation
         self._on_position = on_position  # seconds into the current track, for resume and lyrics
         self.rate = int(audio_cfg["sample_rate"])
         self.device = find_device(audio_cfg["output_device"], "output")
         self.channels = min(2, int(sd.query_devices(self.device, "output")["max_output_channels"]))
-        self.gain = volume_gain(int(audio_cfg["volume"]))
+        self.night = night  # caps the volume at night; None = never
+        self.level = int(audio_cfg["volume"])  # what the brain set, before the night cap
+        self.loud = False  # the track is an alarm's music: never quieted
+        self._set_gains()
         self.duck_gain = float(music_cfg["duck_volume"])
         self._duck_target = self._duck_now = 1.0
         self._loop = loop
@@ -64,12 +67,14 @@ class MusicPlayer:
         return self._seek + self._played / self.rate
 
     # Control ---------------------------------------------------------------
-    def play(self, track: dict) -> None:
+    def play(self, track: dict, alarm: bool = False) -> None:
         self._stop_progress()
         if self.track is not None:
             self._report_position()  # the chapter being replaced keeps its place
         self.stop(report=False)
         self.track = track
+        self.loud = alarm  # an alarm's music is never quieted at night
+        self._set_gains()
         self._seek = float(track.get("start") or 0.0)
         self._played = 0
         self.lyric_words = {phonetic(w) for w in words(track.get("lyrics") or "")}
@@ -111,6 +116,18 @@ class MusicPlayer:
             log.info("stopped")
 
     def set_volume(self, level: int) -> None:
+        """The volume the brain set; the night mode may cap it."""
+        self.level = int(level)
+        self._set_gains()
+
+    def refresh_volume(self) -> None:
+        """Re-apply the night cap when the window opens or closes, or music is freed from it."""
+        self._set_gains()
+
+    def _set_gains(self) -> None:
+        level = self.level
+        if self.night is not None and not self.loud and not self.night.free_music:
+            level = self.night.level(level)
         self.gain = volume_gain(level)
 
     def duck(self, on: bool) -> None:
