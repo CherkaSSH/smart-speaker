@@ -250,3 +250,9 @@ brain_url = "ws://127.0.0.1:8770/ws"
 follow_up_seconds = 6
 # After the bare wake phrase, wait this long for the command.
 listen_seconds = 7
+# While a slow answer is on its way (the big model, a web search, a tool),
+# play quiet music after this many seconds of silence. 0 turns it off.
+hold_music_after = 2.5
+# "builtin" (a soft bell loop), or an audio file of your own (any format
+# ffmpeg reads; the first two minutes loop, scaled under the voice).
+hold_music = "builtin"

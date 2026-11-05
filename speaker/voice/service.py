@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 import time
 import uuid
 from collections import deque
@@ -45,6 +46,28 @@ CONVERSATION_STATES = {"listening", "speaking", "thinking", "ringing"}
 RING_SECONDS = 60
 ECHO_TAIL = 0.5  # seconds after our last sound that the mic may still hear it (buffers, room echo)
 TALK_HOLD = 2.5  # seconds the music stays ducked after the user was last heard over it
+HOLD_PEAK = 0.2  # a file used as waiting music is scaled to this peak: background, under the voice
+HOLD_MAX_SECONDS = 120  # and cut to this length (it loops)
+
+
+def _hold_audio(cfg: Config, spec: str) -> np.ndarray | None:
+    """The waiting music: the built-in loop, an audio file (decoded once by ffmpeg), or None for ""."""
+    if not spec:
+        return None
+    if spec == "builtin":
+        return sounds.hold()
+    path = cfg.file(spec)
+    raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-t", str(HOLD_MAX_SECONDS),
+                          "-ac", "1", "-ar", str(sounds.RATE), "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    audio = np.frombuffer(raw, np.float32).copy()
+    if not len(audio):
+        raise ValueError(f"[voice] hold_music: no audio in {path}")
+    audio *= HOLD_PEAK / max(float(np.abs(audio).max()), 1e-6)
+    fade = min(len(audio) // 2, sounds.RATE // 2)  # half a second in and out: the loop joins softly
+    audio[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
+    audio[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
+    return audio
 
 
 class Voice:
@@ -54,6 +77,9 @@ class Voice:
         self.follow_up_seconds = float(v["follow_up_seconds"])
         self.listen_seconds = float(v["listen_seconds"])
         self.brain_url = v["brain_url"]
+        self.hold_after = float(v["hold_music_after"])
+        self.hold_audio = _hold_audio(cfg, v["hold_music"]) if self.hold_after > 0 else None
+        self.holding = False  # the waiting music is queued instead of an answer
         self.wake = WakeMatcher(w["phrases"], float(w["threshold"]))
         self.stop_words = {" ".join(words(s)) for s in w["stop_words"]}
         # One record of everything we play, so the mic can subtract it (echo cancellation).
@@ -97,6 +123,7 @@ class Voice:
         self.ignore_before = 0.0  # audio at or before this time already belongs to an older turn
         self.handled: list[tuple[float, float]] = []  # time spans of utterances already acted on
         self.recognition_started = 0.0
+        self.state_since = 0.0  # when the current state began
 
     # Helpers -------------------------------------------------------------
     def _set_streams_active(self, active: bool) -> None:
@@ -131,6 +158,7 @@ class Voice:
         if state != self.state:
             log.info("%s -> %s%s", self.state, state, f" ({why})" if why else "")
             self.state = state
+            self.state_since = time.monotonic()
             self._set_streams_active(state != "idle")
             self._update_duck()
         if state == "idle" and self.turn_id is None and self.waiting:
@@ -222,6 +250,7 @@ class Voice:
             self.ring_task.cancel()
         was_busy = self.state in ("thinking", "speaking")
         self.turn_id = None
+        self.holding = False
         self.player.stop()
         self.play_end = 0.0
         if was_busy:
@@ -419,6 +448,7 @@ class Voice:
             if turn != self.turn_id:
                 continue
             if text is None:  # end of the answer: wait for it to finish playing
+                self._stop_hold()
                 await self.player.wait_idle()
                 if turn != self.turn_id:
                     continue
@@ -435,6 +465,7 @@ class Voice:
             if turn != self.turn_id:
                 continue
             self.set_state("speaking")
+            self._stop_hold()
             self.play(audio, self.tts.rate, text)
             if self.first_audio_pending:
                 self.first_audio_pending = False
@@ -463,12 +494,35 @@ class Voice:
         while True:
             await asyncio.sleep(0.2)
             self._update_duck()  # speech playback and the talk hold end on their own
+            self._hold_tick()
             if self.state == "listening" and time.monotonic() > self.listen_until and not self.player.playing:
                 self.play(sounds.listen_end(), sounds.RATE)
                 self.set_state("idle", "nobody spoke")
             elif self.state == "idle" and self.recognition_active \
                     and time.monotonic() > self.recognition_started + 4:
                 self._set_streams_active(False)
+
+    def _hold_tick(self) -> None:
+        """Quiet music while a slow answer is on its way (the big model, a web search, a tool):
+        it starts after `hold_music_after` seconds of silence in a turn and loops until the answer."""
+        waiting = (self.hold_audio is not None and self.turn_id is not None
+                   and self.state in ("thinking", "speaking") and self.speech.empty()
+                   and self.music.state != "playing")  # playing music already fills the silence
+        if not waiting:
+            self._stop_hold()
+        elif self.holding:
+            if not self.player.playing:
+                self.player.play(self.hold_audio, sounds.RATE)  # loop
+        elif not self.player.playing \
+                and time.monotonic() - max(self.state_since, self.player.last_sound) >= self.hold_after:
+            log.info("waiting music: the answer is slow")
+            self.holding = True
+            self.player.play(self.hold_audio, sounds.RATE)
+
+    def _stop_hold(self) -> None:
+        if self.holding:
+            self.holding = False
+            self.player.stop()
 
     async def brain_link(self) -> None:
         async with aiohttp.ClientSession() as http:
