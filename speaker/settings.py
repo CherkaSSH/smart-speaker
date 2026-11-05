@@ -24,7 +24,7 @@ USERS = {
     "music": ("brain", "voice"),
     "asr": ("asr", "voice"), "tts": ("voice",), "llm": ("llm", "brain"), "remote_llm": ("brain",),
     "omp": ("brain",), "web_search": ("brain",), "news": ("brain",), "shopping": ("brain",),
-    "memory": ("embed", "brain"), "brain": ("brain",),
+    "memory": ("embed", "brain"), "brain": ("brain",), "telegram": ("brain",), "discord": ("brain",),
     "voice": ("voice",), "speakers": ("voice",),
 }
 CHOICES = {

@@ -343,8 +343,7 @@ class Agents:
         if started:
             n, _, lang = started
             log.error("thread %d never connected", n)
-            await self.brain.speak("Агент не запустился." if lang == "ru" else "The agent didn't start.", lang,
-                                   queue=True)
+            await self._speak("Агент не запустился." if lang == "ru" else "The agent didn't start.", lang)
 
     # Messages from threads ----------------------------------------------
     async def _send(self, t: Thread, msg: dict) -> None:
@@ -360,6 +359,11 @@ class Agents:
             return None
         self.focus = t
         return "Передаю." if t.lang == "ru" else "Passing it on."
+
+    async def _speak(self, text: str, lang: str, pending=None) -> None:
+        """Say an agent's message on the speaker; with no voice service connected it goes to the notify chat."""
+        await self.brain.speak(text, lang, queue=True, pending=pending)
+        self.brain.chat.notify_soon("agents", text)
 
     async def _on_message(self, t: Thread, d: dict) -> None:
         kind = d.get("type")
@@ -379,26 +383,26 @@ class Agents:
             t.busy, t.name = bool(d.get("busy")), d.get("name") or t.name
         elif kind == "say":
             self.focus = t
-            await self.brain.speak(f"{self._label(t, t.lang)}: {d.get('text', '')}", t.lang, queue=True)
+            await self._speak(f"{self._label(t, t.lang)}: {d.get('text', '')}", t.lang)
         elif kind == "ask":
             self.focus = t
             qid = d.get("id", "")
 
             async def reply(text: str | None) -> str | None:
                 return await self.answer_question(t, qid, text)
-            await self.brain.speak(f"{self._label(t, t.lang)} {'спрашивает' if ru else 'asks'}: {d.get('text', '')}",
-                                   t.lang, queue=True, pending=self.brain.expect_reply(t.lang, reply))
+            await self._speak(f"{self._label(t, t.lang)} {'спрашивает' if ru else 'asks'}: {d.get('text', '')}",
+                              t.lang, pending=self.brain.expect_reply(t.lang, reply))
         elif kind == "done":
             said = _short(d.get("text", ""))
             head = f"{self._label(t, t.lang)} {'закончил' if ru else 'is done'}."
-            await self.brain.speak(f"{head} {said}" if said else head, t.lang, queue=True)
+            await self._speak(f"{head} {said}" if said else head, t.lang)
         elif kind == "btw_reply":
             if d.get("error") or not d.get("text"):
                 log.warning("side question failed: %s", d.get("error"))
                 text = f"{self._label(t, t.lang)} {'не ответил' if ru else 'did not answer'}."
             else:
                 text = f"{self._label(t, t.lang)} {'отвечает' if ru else 'says'}: {d['text']}"
-            await self.brain.speak(text, t.lang, queue=True)
+            await self._speak(text, t.lang)
 
     async def ws_handler(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=20)

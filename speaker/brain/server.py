@@ -34,6 +34,9 @@ Coding-agent threads (omp sessions) connect to /omp; see agents.py and omp/speak
 
 HTTP: POST /ask {"text", "lang"?, "speak"?, "big"?, "speaker"?} answers in JSON,
 for testing without audio; "speak": true also sends it to the voice service.
+
+Text chat (Telegram, Discord) runs beside the voice: see chat.py. Chat messages go through `answer` in
+their own tasks, with their own `speaker` and `pending` (see `chat_scope`), never through `start_turn`.
 """
 
 from __future__ import annotations
@@ -46,6 +49,8 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from aiohttp import WSMsgType, web
@@ -54,6 +59,7 @@ from ..config import Config
 from ..lang import detect as detect_lang
 from . import intents, speech
 from .agents import Agents
+from .chat import Chat
 from .escalate import RemoteLLM
 from .history import History, format_fact
 from .llm import LLM
@@ -68,6 +74,11 @@ from .text import SentenceSplitter
 from .websearch import WebSearch
 
 log = logging.getLogger("brain")
+
+# Who is talking and which conversation a question belongs to. A voice turn and each chat user run in their
+# own task, so each sees its own values; "" is the voice.
+_speaker_var: ContextVar[str | None] = ContextVar("speaker", default=None)
+_scope_var: ContextVar[str] = ContextVar("scope", default="")
 
 CONFIRM_SECONDS = 30  # how long a "should I ...?" question waits for its yes/no
 MISSED_RING_SECONDS = 90  # a ring kept this briefly (a voice restart) still rings normally, without "missed"
@@ -218,15 +229,15 @@ class Brain:
         self.news = News(cfg["news"])
         self.rates = Rates()
         self.shopping = Shopping(cfg.file(cfg["shopping"]["state_file"]))
+        self.chat = Chat(self, cfg)  # Telegram and Discord; started by serve()
         self.confirm_big = bool(r["confirm"])
         self.offer_big_for_search = bool(cfg["web_search"]["offer_big_model"])
         self.schemas = SCHEMAS + ([WEB_SEARCH_SCHEMA] if self.web.enabled else []) \
             + ([BIG_MODEL_SCHEMA] if self._big_ready else [])
-        self.pending: Pending | None = None  # a question the speaker asked and awaits an answer to
+        self._pendings: dict[str, Pending] = {}  # a question the speaker asked and awaits an answer to, per conversation
         self.awaiting: dict[str, Pending] = {}  # questions sent to the voice service, not yet asked aloud
         self.clients: set[web.WebSocketResponse] = set()
         self.turn: asyncio.Task | None = None
-        self.speaker: str | None = None  # recognised voice during a turn, None otherwise
         self.voice_names: list[str] = []  # enrolled voice profiles, as the voice service last listed them
         self.history = History(int(b["history_minutes"]))
         self.last_answer: dict[str | None, str] = {}  # for «повтори», per speaker
@@ -235,6 +246,38 @@ class Brain:
     @property
     def _big_ready(self) -> bool:
         return bool(self.remote and self.remote.configured)
+
+    @property
+    def speaker(self) -> str | None:
+        """Who is talking in the current turn (a recognised voice or a chat user); None if unknown."""
+        return _speaker_var.get()
+
+    @speaker.setter
+    def speaker(self, name: str | None) -> None:
+        _speaker_var.set(name)
+
+    @property
+    def pending(self) -> Pending | None:
+        """The question awaiting an answer in the current conversation (the voice's, or a chat user's)."""
+        return self._pendings.get(_scope_var.get())
+
+    @pending.setter
+    def pending(self, p: Pending | None) -> None:
+        if p is None:
+            self._pendings.pop(_scope_var.get(), None)
+        else:
+            self._pendings[_scope_var.get()] = p
+
+    @contextmanager
+    def chat_scope(self, scope: str, speaker: str | None):
+        """Run `answer` for a chat user: their own speaker name and their own pending question, apart from
+        the voice's and everyone else's, so concurrent conversations cannot answer each other's questions."""
+        scope_token, speaker_token = _scope_var.set(scope), _speaker_var.set(speaker)
+        try:
+            yield
+        finally:
+            _speaker_var.reset(speaker_token)
+            _scope_var.reset(scope_token)
 
     # State -------------------------------------------------------------
     def _load(self) -> None:
@@ -296,6 +339,7 @@ class Brain:
                            dt.datetime.fromtimestamp(m["due"]).strftime("%H:%M")) != key] + [entry]
         self.missed = self.missed[-MAX_MISSED_RINGS:]
         self._save()
+        self.chat.notify_soon("rings", missed_ring_text(item.kind, item.label, item.seconds, due, item.lang))
 
     async def _deliver_missed(self) -> None:
         """A voice service just connected: ring what went off while none was there."""
@@ -681,9 +725,11 @@ async def serve(cfg: Config) -> None:
     b = cfg["brain"]
     await web.TCPSite(runner, b["host"], int(b["port"])).start()
     log.info("brain listening on %s:%s", b["host"], b["port"])
+    brain.chat.start()
     try:
         await brain.scheduler.run()
     finally:
+        await brain.chat.close()
         await brain.llm.close()
         await brain.memory.close()
         await runner.cleanup()

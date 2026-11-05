@@ -271,6 +271,11 @@ async def handle(brain: "Brain", text: str, lang: str) -> str | None:
     if reply is not None:
         return reply
 
+    # Speaker -> chat: «напиши Мише в телеграм, что я скоро буду» --------------
+    reply = await brain.chat.command(text, lang)
+    if reply is not None:
+        return reply
+
     # Voice profiles -----------------------------------------------------
     # Who is talking comes from the voice service (`brain.speaker` during a turn).
     speaker = brain.speaker

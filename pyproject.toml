@@ -18,6 +18,7 @@ dependencies = [
     "yandex-music>=2.2",
     "yandex-book-api[async]>=2.0.2",
     "sherpa-onnx>=2.0.1",
+    "discord-py>=2.4",
 ]
 
 [project.scripts]
