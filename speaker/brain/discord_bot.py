@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 
-from .chat import Chat, Service, split_message
+from .chat import MAX_VOICE_BYTES, MAX_VOICE_SECONDS, Chat, Service, TranscribeError, split_message
 
 log = logging.getLogger("brain.discord")
 
@@ -28,6 +28,7 @@ class DiscordBot(Service):
     def __init__(self, chat: Chat, cfg, scfg: dict):
         super().__init__(chat, cfg, scfg)
         self.channels: set[int] = {int(c) for c in scfg["channels"]}
+        self.voice_notes = bool(scfg.get("voice_notes", True))
         self.client = None
         self.ready = asyncio.Event()
 
@@ -99,9 +100,15 @@ class DiscordBot(Service):
         async def reply(out: str) -> None:
             await self._reply(message.channel, out)
 
+        member = self.member(uid) is not None
+        voice = self._voice_attachment(message)
+        if voice is not None and not text:
+            if not member or not self.voice_notes:  # never download a stranger's file
+                return
+            text = await self._transcribe(voice, reply)
         if not text:
             return
-        if self.member(uid) is None:
+        if not member:
             if direct:  # registration and access requests happen in private, never in a server channel
                 await self.chat.handle(self, uid, display, text, reply)
             else:
@@ -109,6 +116,34 @@ class DiscordBot(Service):
             return
         async with message.channel.typing():
             await self.chat.handle(self, uid, display, text, reply)
+
+    @staticmethod
+    def _voice_attachment(message):
+        """The audio of a voice message (Discord's mic button), or an audio file sent alone; else None."""
+        flags = getattr(message, "flags", None)
+        for a in getattr(message, "attachments", []) or []:
+            if getattr(flags, "voice", False) or str(getattr(a, "content_type", "") or "").startswith("audio/"):
+                return a
+        return None
+
+    async def _transcribe(self, attachment, reply) -> str:
+        """The words of a voice message, echoed back like in Telegram; "" when there are none."""
+        if (getattr(attachment, "duration", None) or 0) > MAX_VOICE_SECONDS or attachment.size > MAX_VOICE_BYTES:
+            await reply("Слишком длинное голосовое. / That voice message is too long.")
+            return ""
+        import discord
+        try:
+            text = await self.chat.transcribe(await attachment.read())
+        except (TranscribeError, discord.HTTPException) as e:
+            log.warning("voice message failed: %s", e)
+            await reply("Не получилось разобрать голосовое. / I couldn't make out that voice message.")
+            return ""
+        if not text:
+            await reply("Ничего не разобрала. / I couldn't hear any words.")
+            return ""
+        log.info("voice message: %s", text)
+        await reply(f"🎤 «{text}»")
+        return text
 
     async def on_say(self, interaction, text: str) -> None:
         """The /say slash command."""

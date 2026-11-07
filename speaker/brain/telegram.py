@@ -9,23 +9,18 @@ decoded with ffmpeg to 16 kHz mono and transcribed by the running ASR server's o
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import time
-import wave
-from urllib.parse import urlsplit
 
 import aiohttp
 
-from .chat import Chat, Service, split_message
+from .chat import MAX_VOICE_BYTES, MAX_VOICE_SECONDS, Chat, Service, TranscribeError, split_message
 
 log = logging.getLogger("brain.telegram")
 
 POLL_SECONDS = 30  # long-poll wait of one getUpdates
 STALE_SECONDS = 300  # messages older than this (sent while the brain was down) are ignored, not run late
 MAX_TEXT = 4000  # Telegram's limit is 4096 characters
-MAX_VOICE_SECONDS = 180
-MAX_VOICE_BYTES = 5_000_000
 
 
 class TelegramError(Exception):
@@ -45,9 +40,6 @@ class TelegramBot(Service):
         self._token = ""
         self._send_lock = asyncio.Lock()
         self._http: aiohttp.ClientSession | None = None
-        asr_url = urlsplit(cfg["asr"]["url"])  # ws://host:port/v1/... -> http://host:port/v1/audio/transcriptions
-        self.asr_url = f"{'https' if asr_url.scheme == 'wss' else 'http'}://{asr_url.netloc}/v1/audio/transcriptions"
-        self.asr_language = cfg["asr"]["language"]
 
     # Bot API -------------------------------------------------------------
     def _clean(self, e: BaseException) -> str:
@@ -108,37 +100,6 @@ class TelegramBot(Service):
         if len(data) > MAX_VOICE_BYTES:
             raise TelegramError("download: file too large")
         return data
-
-    # Voice notes ---------------------------------------------------------
-    async def transcribe(self, ogg: bytes) -> str:
-        """OGG/Opus -> 16 kHz mono (ffmpeg) -> the ASR server's offline transcription."""
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            pcm, err = await asyncio.wait_for(proc.communicate(ogg), 30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise TelegramError("ffmpeg timed out") from None
-        if proc.returncode != 0 or not pcm:
-            raise TelegramError(f"ffmpeg failed: {err.decode(errors='replace').strip()[:200]}")
-        wav = io.BytesIO()
-        with wave.open(wav, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(16000)
-            w.writeframes(pcm)
-        form = aiohttp.FormData()
-        form.add_field("file", wav.getvalue(), filename="note.wav", content_type="audio/wav")
-        form.add_field("response_format", "json")
-        form.add_field("language", self.asr_language)
-        try:
-            async with self._http.post(self.asr_url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as r:
-                if r.status != 200:
-                    raise TelegramError(f"ASR: HTTP {r.status}")
-                return ((await r.json(content_type=None)).get("text") or "").strip()
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-            raise TelegramError(f"ASR failed: {type(e).__name__}") from None
 
     # Receiving -----------------------------------------------------------
     async def run(self) -> None:
@@ -250,8 +211,8 @@ class TelegramBot(Service):
                 return
             try:
                 await typing()
-                text = await self.transcribe(await self._download(voice["file_id"]))
-            except TelegramError as e:
+                text = await self.chat.transcribe(await self._download(voice["file_id"]))
+            except (TelegramError, TranscribeError) as e:
                 log.warning("voice note from %s failed: %s", uid, e)
                 await reply("Не получилось разобрать голосовое. / I couldn't make out that voice note.")
                 return

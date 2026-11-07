@@ -375,3 +375,5 @@ notify_to = ""
 notify = ["rings", "agents"]
 # Forward also while the speaker is running and says it itself.
 notify_always = false
+# Voice messages (the mic button) are transcribed and answered in text, as in Telegram.
+voice_notes = true

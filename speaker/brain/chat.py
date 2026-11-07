@@ -21,12 +21,17 @@ configured chat.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
 import time
+import wave
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+import aiohttp
 
 from ..config import Config
 from ..lang import detect as detect_lang
@@ -43,8 +48,15 @@ SEND_TIMEOUT = 30  # seconds for a message out of a voice command
 CHAT_CONFIRM_SECONDS = 600  # how long a "should I ...?" question to a chat user waits for their yes/no
 NAME_MATCH = 0.8  # how closely a spoken name must match a contact (music's fuzzy score)
 MAX_NAME = 40  # characters of a chosen name
+MAX_VOICE_SECONDS = 180  # longer voice messages are refused
+MAX_VOICE_BYTES = 5_000_000
 
 Reply = Callable[[str], Awaitable[None]]
+
+
+class TranscribeError(Exception):
+    pass
+
 
 _COMMAND = re.compile(r"^[/!]([a-zA-Zа-яА-Я]+)(?:@\w+)?(?:\s+(.*))?$", re.S)
 # A registration: the six digits alone, or after /register (/start, /reg), optionally followed by a name.
@@ -471,6 +483,42 @@ class Chat:
         said = " ".join(s.strip() for s in out if s.strip())
         log.info("%s: -> %s", svc.name, said)
         return said or ("Готово." if lang == "ru" else "Done.")
+
+    async def transcribe(self, audio: bytes) -> str:
+        """A voice message (OGG/Opus or any format ffmpeg reads) -> 16 kHz mono -> the running ASR server's
+        offline transcription (`POST /v1/audio/transcriptions`, beside its realtime endpoint)."""
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-v", "error", "-i", "pipe:0", "-t", str(MAX_VOICE_SECONDS), "-f", "s16le", "-ar", "16000",
+            "-ac", "1", "pipe:1", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        try:
+            pcm, err = await asyncio.wait_for(proc.communicate(audio), 30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise TranscribeError("ffmpeg timed out") from None
+        if proc.returncode != 0 or not pcm:
+            raise TranscribeError(f"ffmpeg failed: {err.decode(errors='replace').strip()[:200]}")
+        wav = io.BytesIO()
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm)
+        a = self.cfg["asr"]
+        url = urlsplit(a["url"])  # ws://host:port/v1/... -> http://host:port/v1/audio/transcriptions
+        form = aiohttp.FormData()
+        form.add_field("file", wav.getvalue(), filename="note.wav", content_type="audio/wav")
+        form.add_field("response_format", "json")
+        form.add_field("language", a["language"])
+        try:
+            async with aiohttp.ClientSession() as http, http.post(
+                    f"{'https' if url.scheme == 'wss' else 'http'}://{url.netloc}/v1/audio/transcriptions",
+                    data=form, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status != 200:
+                    raise TranscribeError(f"ASR: HTTP {r.status}")
+                return ((await r.json(content_type=None)).get("text") or "").strip()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            raise TranscribeError(f"ASR failed: {type(e).__name__}") from None
 
     async def say(self, name: str, msg: str) -> str:
         """/say: the speaker says «<name> пишет: …» as soon as it is free."""
