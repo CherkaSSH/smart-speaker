@@ -76,9 +76,11 @@ from .websearch import WebSearch
 log = logging.getLogger("brain")
 
 # Who is talking and which conversation a question belongs to. A voice turn and each chat user run in their
-# own task, so each sees its own values; "" is the voice.
+# own task, so each sees its own values; "" is the voice. The voice is trusted fully ("admin"); a chat user
+# may be a plain "user", who cannot reach the coding agents (see `answer`).
 _speaker_var: ContextVar[str | None] = ContextVar("speaker", default=None)
 _scope_var: ContextVar[str] = ContextVar("scope", default="")
+_role_var: ContextVar[str] = ContextVar("role", default="admin")
 
 CONFIRM_SECONDS = 30  # how long a "should I ...?" question waits for its yes/no
 MISSED_RING_SECONDS = 90  # a ring kept this briefly (a voice restart) still rings normally, without "missed"
@@ -268,16 +270,28 @@ class Brain:
         else:
             self._pendings[_scope_var.get()] = p
 
+    @property
+    def in_chat(self) -> bool:
+        """True while answering a chat message, False for the voice."""
+        return _scope_var.get() != ""
+
+    @property
+    def role(self) -> str:
+        """"admin" for the voice and chat admins, "user" for plain chat users (no coding agents)."""
+        return _role_var.get()
+
     @contextmanager
-    def chat_scope(self, scope: str, speaker: str | None):
-        """Run `answer` for a chat user: their own speaker name and their own pending question, apart from
-        the voice's and everyone else's, so concurrent conversations cannot answer each other's questions."""
-        scope_token, speaker_token = _scope_var.set(scope), _speaker_var.set(speaker)
+    def chat_scope(self, scope: str, speaker: str | None, role: str = "admin"):
+        """Run `answer` for a chat user: their own speaker name, pending question and role, apart from
+        the voice's and everyone else's, so concurrent conversations cannot answer each other's questions
+        and a "user" never gets what only an "admin" may do."""
+        tokens = _scope_var.set(scope), _speaker_var.set(speaker), _role_var.set(role)
         try:
             yield
         finally:
-            _speaker_var.reset(speaker_token)
-            _scope_var.reset(scope_token)
+            _role_var.reset(tokens[2])
+            _speaker_var.reset(tokens[1])
+            _scope_var.reset(tokens[0])
 
     # State -------------------------------------------------------------
     def _load(self) -> None:
@@ -510,7 +524,10 @@ class Brain:
                 async for sentence in self.remote.respond(messages):
                     yield sentence
             return
-        reply = await self.agents.handle(text, lang)
+        if _role_var.get() == "admin":
+            reply = await self.agents.handle(text, lang)
+        else:  # the agents have shell access: only an admin reaches them, never a plain chat user
+            reply = self.agents.refuse(text, lang)
         if reply is not None:
             log.info("agent command: %r -> %r", text, reply)
             yield reply

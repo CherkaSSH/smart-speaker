@@ -24,7 +24,8 @@ USERS = {
     "music": ("brain", "voice"),
     "asr": ("asr", "voice"), "tts": ("voice",), "llm": ("llm", "brain"), "remote_llm": ("brain",),
     "omp": ("brain",), "web_search": ("brain",), "news": ("brain",), "shopping": ("brain",),
-    "memory": ("embed", "brain"), "brain": ("brain",), "telegram": ("brain",), "discord": ("brain",),
+    "memory": ("embed", "brain"), "brain": ("brain",), "chat": ("brain",), "telegram": ("brain",),
+    "discord": ("brain",),
     "voice": ("voice",), "speakers": ("voice",),
 }
 CHOICES = {
@@ -37,7 +38,7 @@ RANGES = {
     ("wake", "threshold"): (0, 1), ("gate", "vad_threshold"): (0, 1), ("audio", "volume"): (0, 10),
     ("memory", "recall_threshold"): (0, 1), ("llm", "temperature"): (0, 2), ("remote_llm", "temperature"): (0, 2),
     ("brain", "history_minutes"): (0, 1_440), ("audio", "night_volume"): (0, 10),
-    ("speakers", "threshold"): (0, 1), ("speakers", "min_seconds"): (0, 10),
+    ("speakers", "threshold"): (0, 1), ("speakers", "min_seconds"): (0, 10), ("chat", "code_minutes"): (1, 1_440),
 }
 
 

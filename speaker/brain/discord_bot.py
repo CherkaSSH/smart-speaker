@@ -1,8 +1,8 @@
 """Discord bot: the gateway connection of discord.py, no webhook and no listening port.
 
-It answers allowed users in direct messages, when mentioned in a server, and in the configured
+It answers known users in direct messages, when mentioned in a server, and in the configured
 `channels` (every message there). `!say text` and the `/say` slash command make the speaker say it
-aloud. Strangers who message the bot directly get one refusal with their id; in a channel they are
+aloud. Strangers register or ask for access in a direct message (see chat.py); in a server they are
 ignored. Needs the Message Content intent (enable it on the bot's page in the developer portal).
 """
 
@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 
-from .chat import Chat, Service, refusal, split_message
+from .chat import Chat, Service, split_message
 
 log = logging.getLogger("brain.discord")
 
@@ -23,12 +23,16 @@ READY_TIMEOUT = 15  # seconds a send waits for the gateway after a reconnect
 class DiscordBot(Service):
     name = "discord"
     title = "дискорд"
+    prefix = "!"
 
     def __init__(self, chat: Chat, cfg, scfg: dict):
         super().__init__(chat, cfg, scfg)
         self.channels: set[int] = {int(c) for c in scfg["channels"]}
         self.client = None
         self.ready = asyncio.Event()
+
+    def target(self, uid: int) -> str:
+        return f"user:{uid}"
 
     @property
     def me_id(self) -> int:
@@ -95,15 +99,15 @@ class DiscordBot(Service):
         async def reply(out: str) -> None:
             await self._reply(message.channel, out)
 
-        if uid not in self.allowed and not (direct or mentioned):
-            log.debug("ignoring user id %s in channel %s", uid, message.channel.id)  # a stranger just talking
-            return
         if not text:
             return
-        if uid in self.allowed:
-            async with message.channel.typing():
+        if self.member(uid) is None:
+            if direct:  # registration and access requests happen in private, never in a server channel
                 await self.chat.handle(self, uid, display, text, reply)
-        else:
+            else:
+                log.debug("ignoring stranger id %s in channel %s", uid, message.channel.id)
+            return
+        async with message.channel.typing():
             await self.chat.handle(self, uid, display, text, reply)
 
     async def on_say(self, interaction, text: str) -> None:
@@ -111,14 +115,12 @@ class DiscordBot(Service):
         uid = int(interaction.user.id)
         display = getattr(interaction.user, "display_name", None) or str(interaction.user.name)
 
-        async def nothing(out: str) -> None:  # the refusal below is private to the user
-            pass
-
-        if not await self.chat.admit(self, uid, display, nothing):
-            await interaction.response.send_message(refusal(uid), ephemeral=True)
+        if self.member(uid) is None:
+            await interaction.response.send_message(
+                "Я тебя пока не знаю: напиши мне в личные сообщения, чтобы зарегистрироваться. / "
+                "I don't know you yet: message me directly to register.", ephemeral=True)
             return
-
-        out = await self.chat.say(self.person(uid, display), text)
+        out = await self.chat.say((self.member(uid)[0] or display), text)
         await interaction.response.send_message(out, allowed_mentions=self._no_mentions())
 
     # Sending -------------------------------------------------------------

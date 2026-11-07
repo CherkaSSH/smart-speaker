@@ -299,6 +299,17 @@ state_file = "state/voices.json"
 # Shorter commands have too little speech to identify anyone.
 min_seconds = 0.6
 
+[chat]
+# Who may use the Telegram and Discord bots besides the ids listed in their
+# sections. A newcomer says «код для телеграма» (or «код для дискорда», «код
+# для чата») to the speaker and sends the six digits it says to the bot; the
+# first person on a bot becomes its admin, later ones plain users. Or they just
+# write to the bot: admins get «Пустить / Отказать», and the speaker asks aloud.
+# Plain users can't reach the coding agents. Registered people are kept here.
+users_file = "state/chat_users.json"
+# How long a spoken code stays valid (one registration each).
+code_minutes = 10
+
 [telegram]
 # Text chat with the speaker in Telegram: a private message to your bot is
 # handled like a spoken request (music, timers, weather, memory, coding agents)
@@ -310,9 +321,9 @@ token_env = "TELEGRAM_BOT_TOKEN"
 token_file = "state/telegram_token"
 # Bot API address; change only to reach a self-hosted Bot API server.
 api_url = "https://api.telegram.org"
-# Only these Telegram user ids are answered; everyone else gets one refusal per
-# hour that shows their own id (and is logged), so you can add it here. Chat
-# with the bot to see yours.
+# Owners: Telegram user ids answered as admins from the config alone (no
+# registration needed). Everyone else registers (see [chat]); a stranger's
+# first message asks the admins to let them in.
 allowed_users = []
 # Speaker names by Telegram user id: { "123456789" = "Миша" }. Use the names of
 # your voice profiles and the history and memories are shared with that person's
@@ -346,8 +357,8 @@ voice_notes = true
 enabled = false
 token_env = "DISCORD_BOT_TOKEN"
 token_file = "state/discord_token"
-# Only these Discord user ids are answered; a stranger who messages the bot or
-# mentions it gets one refusal per hour with their id (and it is logged).
+# Owners, as for Telegram. Strangers register or ask in a direct message to the
+# bot (see [chat]); in a server channel they are ignored.
 allowed_users = []
 # Speaker names by Discord user id, as for Telegram: { "123456789012345678" = "Миша" }.
 users = {}

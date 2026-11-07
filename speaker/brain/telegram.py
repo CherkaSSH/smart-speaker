@@ -1,7 +1,7 @@
 """Telegram bot: long polling of the Bot API, private chats only.
 
 No webhook and no listening port: the brain asks Telegram for updates (`getUpdates`), so nothing on
-the internet can reach it. Only users in the allowlist are answered (see chat.py). Voice notes are
+the internet can reach it. Only known users are answered; strangers register or ask (see chat.py). Voice notes are
 decoded with ffmpeg to 16 kHz mono and transcribed by the running ASR server's offline endpoint
 (`POST /v1/audio/transcriptions`), then handled like typed text.
 """
@@ -88,6 +88,13 @@ class TelegramBot(Service):
             for piece in split_message(text, MAX_TEXT):
                 await self._call("sendMessage", {"chat_id": chat_id, "text": piece})
 
+    async def ask_admin(self, admin: int, uid: int, display: str) -> None:
+        """The access request with two buttons; the answer comes back as a callback query."""
+        buttons = [[{"text": "Пустить", "callback_data": f"approve:{uid}"},
+                    {"text": "Отказать", "callback_data": f"deny:{uid}"}]]
+        await self._call("sendMessage", {"chat_id": admin, "text": f"{display} (id {uid}) просит доступ к боту.",
+                                         "reply_markup": {"inline_keyboard": buttons}})
+
     async def _download(self, file_id: str) -> bytes:
         info = await self._call("getFile", {"file_id": file_id})
         url = f"{self.api_url}/file/bot{self._token}/{info['file_path']}"
@@ -157,7 +164,7 @@ class TelegramBot(Service):
                     announced = True
                 updates = await self._call(
                     "getUpdates", {**({"offset": offset} if offset else {}), "timeout": POLL_SECONDS,
-                                   "allowed_updates": ["message"]},
+                                   "allowed_updates": ["message", "callback_query"]},
                     timeout=POLL_SECONDS + 15, tries=1)
                 backoff = 1.0
             except asyncio.CancelledError:
@@ -177,11 +184,36 @@ class TelegramBot(Service):
     async def _update(self, update: dict) -> None:
         """One update, from its own task: a failure here is logged and never reaches the polling loop."""
         try:
-            await self._message(update.get("message") or {})
+            if "callback_query" in update:
+                await self._button(update["callback_query"])
+            else:
+                await self._message(update.get("message") or {})
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning("handling an update failed: %s", self._clean(e))
+
+    async def _button(self, q: dict) -> None:
+        """An admin pressed «Пустить» or «Отказать» under an access request."""
+        uid = int((q.get("from") or {}).get("id") or 0)
+        action, _, target = str(q.get("data") or "").partition(":")
+        member = self.member(uid)
+        if member is None or member[1] != "admin" or action not in ("approve", "deny") or not target.isdigit():
+            log.warning("ignoring a button press from id %s: %r", uid, q.get("data"))
+            await self._call("answerCallbackQuery", {"callback_query_id": q["id"]}, tries=1)
+            return
+        by = self.chat.who(self, uid)
+        if action == "approve":
+            name = await self.chat.approve(self, int(target), by)
+        else:
+            name = self.chat.deny(self, int(target), by)
+        done = (f"Пустила: {name}." if action == "approve" else f"Отказала: {name}.") if name \
+            else "Этот запрос уже решён."
+        await self._call("answerCallbackQuery", {"callback_query_id": q["id"], "text": done}, tries=1)
+        msg = q.get("message") or {}
+        if msg.get("message_id"):  # replace the buttons with the outcome, so nobody presses them again
+            await self._call("editMessageText", {"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
+                                                 "text": f"{msg.get('text', '')}\n{done}"}, tries=1)
 
     async def _message(self, m: dict) -> None:
         chat, sender = m.get("chat") or {}, m.get("from") or {}

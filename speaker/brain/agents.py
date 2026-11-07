@@ -196,6 +196,14 @@ class Agents:
         self._tasks: set[asyncio.Task] = set()
 
     # Voice commands ------------------------------------------------------
+    def refuse(self, text: str, lang: str) -> str | None:
+        """For a chat user without the admin role: what to say to an agent command instead of running it
+        (None when `text` isn't one). Nothing here touches a thread."""
+        if not self.enabled or parse(text) is None:
+            return None
+        log.warning("agent command refused for a chat user without the admin role: %r", text)
+        return "С агентами может говорить только админ." if lang == "ru" else "Only an admin can talk to the agents."
+
     async def handle(self, text: str, lang: str) -> str | None:
         """The spoken reply to an agent command, or None when `text` isn't one."""
         if not self.enabled:
